@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "echelon-optimizer"
+version = "0.1.0"
+description = "Echelon optimizer for PyTorch: rank-anchored spectral clipping"
+readme = "README.md"
+license = "BSD-3-Clause"
+requires-python = ">=3.11"
+authors = [{name = "Andrew Pullin"}]
+dependencies = ["torch>=2.6"]
+
+[project.urls]
+Homepage = "https://github.com/apullin/echelon"
+Source = "https://github.com/apullin/echelon"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/echelon"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
