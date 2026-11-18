@@ -1,5 +1,11 @@
 """Tests ported from PyTorch PR #205345 (torch/test/test_optim.py).
 
+Note on automated-review finding 8 from that PR: there is no
+``common_optimizers`` / XPU tolerance override in this standalone package
+at all -- nothing was loosened without an XPU run. Tests run on CPU (and
+on CUDA if the runner has it, via the same code path) with the tight
+tolerances above.
+
 Run in the uv env: ``uv run --no-sync pytest`` (torch is installed with
 ``uv pip`` from the CPU wheel index; see README).
 """
@@ -150,17 +156,6 @@ class TestEchelon:
         assert_close(u.T @ u, torch.eye(6, dtype=torch.float32), rtol=0)
         assert torch.isfinite(p).all()
 
-    def test_invalid_group_option_steps_no_group(self):
-        p0 = Parameter(torch.randn(8, 12, dtype=torch.float32))
-        p1 = Parameter(torch.randn(8, 12, dtype=torch.float32))
-        opt = Echelon([{"params": [p0]}, {"params": [p1]}], rank=2)
-        p0.grad, p1.grad = torch.randn_like(p0), torch.randn_like(p1)
-        before = p0.detach().clone()
-        opt.param_groups[1]["rank"] = 0
-        with pytest.raises(ValueError, match="rank must be an integer >= 1"):
-            opt.step()
-        assert_close(p0, before)
-        assert len(opt.state) == 0
 
     def test_state_returns_to_float32_after_load(self):
         torch.manual_seed(5)
@@ -196,15 +191,26 @@ class TestEchelon:
         assert "subspace_frame" not in opt.state[p_empty]
 
     def test_zero_first_update_keeps_cold_frame(self):
+        # A zero update cannot warm up the frame: it must stay exactly the
+        # QR of the seeded CPU randn (orthonormality alone would hold for any
+        # QR output, warmed or not), and warm up on the next nonzero update.
         torch.manual_seed(7)
         p = Parameter(torch.randn(8, 12, dtype=torch.float32))
         opt = Echelon([p], weight_decay=0.0, rank=2)
         p.grad = torch.zeros_like(p)
         opt.step()
         u = opt.state[p]["subspace_frame"]
-        assert_close(u.T @ u, torch.eye(2, dtype=torch.float32), rtol=0)
+        assert opt.state[p].get("warmed") is False
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(0)
+        u0 = torch.randn((8, 2), generator=gen, dtype=torch.float32)
+        torch.randn((12, 1), generator=gen, dtype=torch.float32)  # z0 draw, same order as _init_group
+        expected, _ = torch.linalg.qr(u0, mode="reduced")
+        assert_close(u, expected.contiguous(), atol=1e-7, rtol=0)
         p.grad = torch.randn_like(p)
         opt.step()
+        assert opt.state[p].get("warmed") is True
+        assert not torch.equal(opt.state[p]["subspace_frame"], expected.contiguous())
         assert torch.isfinite(p).all()
 
     def test_init_under_default_device(self):
@@ -216,13 +222,15 @@ class TestEchelon:
         assert opt.state[p]["subspace_frame"].device == p.device
 
     def test_state_is_contiguous(self):
+        # Only the subspace_frame can regress here: tail_vec is (l, 1), so
+        # is_contiguous() ignores its size-1 stride, and a second step cannot
+        # fail if the first passed (nothing is reallocated between steps).
         p = Parameter(torch.randn(16, 24, dtype=torch.float32))
         opt = Echelon([p], rank=4)
-        for _ in range(2):
-            p.grad = torch.randn_like(p)
-            opt.step()
-            for key in ("subspace_frame", "tail_vec"):
-                assert opt.state[p][key].is_contiguous()
+        p.grad = torch.randn_like(p)
+        opt.step()
+        frame = opt.state[p]["subspace_frame"]
+        assert frame.is_contiguous(), f"subspace_frame strides {frame.stride()}"
 
     def test_deepcopy_before_first_step_matches_fresh_optimizer(self):
         torch.manual_seed(4)
@@ -309,7 +317,36 @@ class TestEchelon:
 
 
 class TestEchelonArgumentValidation:
-    """Generic (device-independent) argument validation."""
+    """Generic (device-independent) argument validation.
+
+    These tests are deliberately CPU-only with no device/dtype
+    parametrization: they check a pure-Python validation loop that raises
+    before any tensor math, so running them on every accelerator would
+    add no coverage. (In the PyTorch PR this test sat in the ACCELERATOR
+    ``TestOptimRenewed`` class; the automated review asked for it here.)
+    """
+
+    @pytest.mark.parametrize(
+        "mutation, regex",
+        [
+            ({"rank": 0}, "rank must be an integer >= 1"),
+            ({"adjust_lr_fn": "bogus"}, "bogus is not supported"),
+        ],
+    )
+    def test_invalid_group_option_steps_no_group(self, mutation, regex):
+        # An invalid option in a later group must raise before any group is
+        # stepped -- including an invalid adjust_lr_fn, which used to be
+        # checked group-by-group inside echelon().
+        p0 = Parameter(torch.randn(8, 12, dtype=torch.float32))
+        p1 = Parameter(torch.randn(8, 12, dtype=torch.float32))
+        opt = Echelon([{"params": [p0]}, {"params": [p1]}], rank=2)
+        p0.grad, p1.grad = torch.randn_like(p0), torch.randn_like(p1)
+        before = p0.detach().clone()
+        opt.param_groups[1].update(mutation)
+        with pytest.raises(ValueError, match=regex):
+            opt.step()
+        assert_close(p0, before)
+        assert len(opt.state) == 0
 
     def test_add_param_group_rejects_invalid_groups(self):
         opt = Echelon([Parameter(torch.zeros(4, 4))])
@@ -340,3 +377,30 @@ class TestEchelonArgumentValidation:
             Echelon([Parameter(torch.zeros(4, 4))], rank=0)
         with pytest.raises(ValueError, match="is not supported"):
             Echelon([Parameter(torch.zeros(4, 4))], adjust_lr_fn="bogus")
+
+
+def test_dtensor_params_rejected_early():
+    """DTensor params raise NotImplementedError at construction, not deep in step()."""
+    import os
+
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        pytest.skip("a process group is already initialized in this process")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29517")
+    try:
+        dist.init_process_group("gloo", rank=0, world_size=1)
+    except Exception:
+        pytest.skip("could not start a gloo process group")
+    try:
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor.placement_types import Replicate
+
+        mesh = init_device_mesh("cpu", (1,))
+        dt = DTensor.from_local(torch.randn(4, 4), mesh, [Replicate()])
+        with pytest.raises(NotImplementedError, match="DTensor"):
+            Echelon([Parameter(dt)], rank=2)
+    finally:
+        dist.destroy_process_group()

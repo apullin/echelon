@@ -76,6 +76,12 @@ uv run --no-sync pytest
 
 - `0.1.0`: the unbatched (for-loop) optimizer from PR #205345, plus the
   batched `foreach` path from internal diff D132660022 (second commit).
+- The 9 non-blocking findings from the last automated review of PR #205345
+  (0594e6e) are addressed in the third commit: up-front `adjust_lr_fn`
+  validation, deferred warmup after a zero/non-finite first update,
+  early DTensor rejection, the contiguous-frame docstring example, the
+  argument-validation test placement, and the fused/in-place step with
+  single option validation. There is no XPU tolerance override in this
+  package (that finding is not applicable here).
 - Known limitations are documented in `Echelon`'s docstring (DTensor,
-  TF32 matmul precision, cold start after a zero/non-finite first update
-  until the first finite, nonzero update warms the frame up).
+  TF32 matmul precision).

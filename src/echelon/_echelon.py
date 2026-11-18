@@ -5,7 +5,7 @@
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterator, MutableMapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import cast
 
 import torch
@@ -71,6 +71,26 @@ _WARMUP_STEPS = 3
 _TAU_FLOOR_MULT = 16.0
 _TINY = 1e-30
 _FP32_EPS = torch.finfo(torch.float32).eps
+
+# Cached DTensor class, resolved lazily: importing torch.distributed on
+# every step would be wasteful, and it may be unavailable in some builds.
+_DTensor = None
+_DTensor_checked = False
+
+
+def _is_dtensor(t: Tensor) -> bool:
+    global _DTensor, _DTensor_checked
+    if not _DTensor_checked:
+        _DTensor_checked = True
+        try:
+            from torch.distributed.tensor import DTensor as _DTensor_cls
+
+            _DTensor = _DTensor_cls
+        except Exception:
+            _DTensor = None
+    return _DTensor is not None and isinstance(t, _DTensor)
+
+
 # Relative diagonal shift of the shifted Cholesky-QR used by the batched (foreach) path.
 _CHOLESKY_QR_SHIFT = 1e-6
 # The foreach path batches same-shape matrices up to this many elements; larger ones gain
@@ -153,66 +173,102 @@ def _echelon_step(
     margin: float,
     eps: float,
     orth: Callable[[Tensor], Tensor] = _householder_qr,
+    autocast_disabled: bool = False,
 ) -> Tensor:
-    """Compute Echelon updates for short-side-first momenta `X` (`... x s x l`, `s <= l`), updating `U` and `z` in place."""
-    with _disable_autocast(X.device.type):
-        Xf = X.to(dtype=torch.float32)
-        s = Xf.size(-2)
-        x_norm = _frob_norm(Xf)
-        denom = x_norm.clamp_min(eps) if eps > 0.0 else x_norm
-        if rank >= s:
-            return _quintic_newton_schulz(
-                Xf / denom.clamp_min(_TINY), ns_coefficients, ns_steps
-            )
+    """Compute Echelon updates for short-side-first momenta `X` (`... x s x l`, `s <= l`), updating `U` and `z` in place.
 
-        if U is None or z is None:
-            raise ValueError(
-                f"subspace_frame and tail_vec must be provided when rank ({rank}) < short_side ({s})"
-            )
-
-        active = torch.isfinite(x_norm) & (x_norm > 0)
-        scale = torch.where(active, x_norm / denom.clamp_min(_TINY), 0.0)
-        X_unit = Xf / x_norm.clamp_min(_TINY)
-        Uf = U.to(dtype=torch.float32)
-
-        # 1. Refresh tracked top-r subspace: V = orth(X^T U), U = orth(X V), keeping U if orth failed
-        U_next = _subspace_step(X_unit, Uf, orth)
-        refresh = active & torch.isfinite(U_next).all(dim=(-2, -1), keepdim=True)
-        Uf = torch.where(refresh, U_next, Uf)
-
-        # 2. Head: H = U^T X, P = NS5(H)
-        H = Uf.mT @ X_unit
-        H_norm = _frob_norm(H)
-        P = _quintic_newton_schulz(
-            (H / H_norm.clamp_min(_TINY)) * scale, ns_coefficients, ns_steps
+    ``autocast_disabled`` is an internal escape hatch for callers (the warmup
+    in :meth:`Echelon._init_group`) that already entered the disabled-autocast
+    context, so the context is entered once per step rather than once per
+    parameter."""
+    ctx = nullcontext() if autocast_disabled else _disable_autocast(X.device.type)
+    with ctx:
+        return _echelon_step_impl(
+            X, U, z, rank=rank, ns_coefficients=ns_coefficients,
+            ns_steps=ns_steps, tau_iters=tau_iters, margin=margin, eps=eps,
+            orth=orth,
         )
 
-        # 3. Tail: T = X - U H (re-projected once to keep U^T T = 0 to fp32 precision)
-        T = X_unit - Uf @ H
-        T = T - Uf @ (Uf.mT @ T)
-        t_frob = _frob_norm(T)
-        tau_floor = _TAU_FLOOR_MULT * math.sqrt(s) * _FP32_EPS * H_norm
 
-        zf = z.to(dtype=torch.float32)
-        z_cur = zf / _frob_norm(zf).clamp_min(_TINY)
-        est = torch.zeros_like(x_norm)
-        for _ in range(tau_iters):
-            w = T @ z_cur
-            est = _frob_norm(w)
-            z_next = T.mT @ w
-            z_next_norm = _frob_norm(z_next)
-            z_cur = torch.where(
-                z_next_norm > 0, z_next / z_next_norm.clamp_min(_TINY), z_cur
-            )
+def _echelon_step_impl(
+    X: Tensor,
+    U: Tensor | None,
+    z: Tensor | None,
+    *,
+    rank: int,
+    ns_coefficients: tuple[float, float, float],
+    ns_steps: int,
+    tau_iters: int,
+    margin: float,
+    eps: float,
+    orth: Callable[[Tensor], Tensor],
+) -> Tensor:
+    Xf = X.to(dtype=torch.float32)
+    s = Xf.size(-2)
+    x_norm = _frob_norm(Xf)
+    denom = x_norm.clamp_min(eps) if eps > 0.0 else x_norm
+    if rank >= s:
+        return _quintic_newton_schulz(
+            Xf / denom.clamp_min(_TINY), ns_coefficients, ns_steps
+        )
 
-        U.copy_(Uf)
-        z.copy_(torch.where(active & (t_frob > tau_floor), z_cur, zf))
+    if U is None or z is None:
+        raise ValueError(
+            f"subspace_frame and tail_vec must be provided when rank ({rank}) < short_side ({s})"
+        )
 
-        # 4. Output: O = U P + T / tau (with lower bound ||T||_F / sqrt(s - r) and ker(T) fallback ||T||_F)
-        tail_lb = t_frob / math.sqrt(s - rank)
-        est = torch.where(est > 0, torch.maximum(est, tail_lb), t_frob)
-        tau = margin * torch.maximum(est, tau_floor).clamp_min(_TINY)
-        return Uf @ P + (T / tau) * scale
+    active = torch.isfinite(x_norm) & (x_norm > 0)
+    scale = torch.where(active, x_norm / denom.clamp_min(_TINY), 0.0)
+    X_unit = Xf / x_norm.clamp_min(_TINY)
+    Uf = U.to(dtype=torch.float32)
+
+    # 1. Refresh tracked top-r subspace: V = orth(X^T U), U = orth(X V), keeping U if orth failed
+    U_next = _subspace_step(X_unit, Uf, orth)
+    refresh = active & torch.isfinite(U_next).all(dim=(-2, -1), keepdim=True)
+    Uf = torch.where(refresh, U_next, Uf)
+
+    # 2. Head: H = U^T X, P = NS5(H)
+    H = Uf.mT @ X_unit
+    H_norm = _frob_norm(H)
+    P = _quintic_newton_schulz(
+        (H / H_norm.clamp_min(_TINY)) * scale, ns_coefficients, ns_steps
+    )
+
+    # 3. Tail: T = X - U H (re-projected once to keep U^T T = 0 to fp32 precision).
+    # Reuse T in place: X_unit is not read again, and the second projection
+    # and the output below fuse into T instead of allocating new s x l tensors.
+    T = X_unit - Uf @ H
+    T -= Uf @ (Uf.mT @ T)
+    t_frob = _frob_norm(T)
+    tau_floor = _TAU_FLOOR_MULT * math.sqrt(s) * _FP32_EPS * H_norm
+
+    zf = z.to(dtype=torch.float32)
+    z_cur = zf / _frob_norm(zf).clamp_min(_TINY)
+    # Fallback if tau_iters is 0 (not reachable via the validated paths,
+    # which require tau_iters >= 1); the loop below overwrites it otherwise.
+    est = t_frob
+    for _ in range(tau_iters):
+        w = T @ z_cur
+        est = _frob_norm(w)
+        z_next = T.mT @ w
+        z_next_norm = _frob_norm(z_next)
+        z_cur = torch.where(
+            z_next_norm > 0, z_next / z_next_norm.clamp_min(_TINY), z_cur
+        )
+
+    U.copy_(Uf)
+    z.copy_(torch.where(active & (t_frob > tau_floor), z_cur, zf))
+
+    # 4. Output: O = U P + T / tau (with lower bound ||T||_F / sqrt(s - r) and ker(T) fallback ||T||_F)
+    tail_lb = t_frob / math.sqrt(s - rank)
+    est = torch.where(est > 0, torch.maximum(est, tail_lb), t_frob)
+    tau = margin * torch.maximum(est, tau_floor).clamp_min(_TINY)
+    T.mul_(scale / tau)
+    if T.ndim == 2:
+        T.addmm_(Uf, P)
+    else:
+        T.baddbmm_(Uf, P)
+    return T
 
 
 def _validate_echelon_hyperparameters(
@@ -260,6 +316,44 @@ def _validate_echelon_options(
         raise ValueError("Coefficients must be a tuple of exactly 3 values")
     if not 0.0 <= eps:
         raise ValueError(f"eps should be >= 0 but is: {eps}")
+
+
+def _warmup_frame(
+    group: MutableMapping,
+    p: Tensor,
+    state: MutableMapping,
+    U: Tensor,
+    z: Tensor,
+    *,
+    rank: int,
+) -> bool:
+    """Warm up ``U``/``z`` on this step's update; return whether it was usable.
+
+    A zero or non-finite update cannot warm the frame up, so it stays at its
+    random start and the caller records the warmup as still pending: it is
+    retried on the first finite, nonzero update (see ``_init_group``).
+    The active check is a host sync, but only on frame creation or while a
+    warmup is pending -- never in the steady state.
+    """
+    m0 = state["momentum_buffer"].lerp(p.grad, 1 - group["momentum"])
+    if group["nesterov"]:
+        m0 = p.grad.lerp(m0, group["momentum"])
+    X0 = m0.T if p.size(0) > p.size(1) else m0
+    x0_norm = torch.linalg.vector_norm(X0.to(dtype=torch.float32))
+    active = bool(torch.isfinite(x0_norm) & (x0_norm > 0))
+    if active:
+        with _disable_autocast(p.device.type):
+            for _ in range(_WARMUP_STEPS):
+                _echelon_step(
+                    X0, U, z, rank=rank,
+                    ns_coefficients=group["ns_coefficients"],
+                    ns_steps=group["ns_steps"],
+                    tau_iters=group["tau_iters"],
+                    margin=group["margin"],
+                    eps=group["eps"],
+                    autocast_disabled=True,
+                )
+    return active
 
 
 class Echelon(Optimizer):
@@ -341,6 +435,11 @@ class Echelon(Optimizer):
                 eps=group["eps"],
             )
             for p in group["params"]:
+                if _is_dtensor(p):
+                    raise NotImplementedError(
+                        "Echelon does not support DTensor parameters "
+                        "(for example under FSDP2)"
+                    )
                 if p.ndim != 2:
                     raise ValueError(
                         f"Echelon only supports 2D parameters whereas we found a parameter with size: {p.size()}"
@@ -361,12 +460,18 @@ class Echelon(Optimizer):
     ) -> bool:
         rank = group["rank"]
         for param_idx, p in enumerate(group["params"]):
+            if _is_dtensor(p):
+                raise NotImplementedError(
+                    "Echelon does not support DTensor parameters "
+                    "(for example under FSDP2)"
+                )
             s, l = min(p.size(0), p.size(1)), max(p.size(0), p.size(1))
             low_rank = p.numel() > 0 and rank < s
             if not low_rank and p in self.state:
                 # A frame kept from a smaller `rank` would later be reused without a warmup.
                 self.state[p].pop("subspace_frame", None)
                 self.state[p].pop("tail_vec", None)
+                self.state[p].pop("warmed", None)
             if p.grad is None:
                 continue
             if torch.is_complex(p):
@@ -400,31 +505,26 @@ class Echelon(Optimizer):
                     # copy into it in place, and some checkpointers write state as raw storage.
                     U0 = U0.contiguous()
                     z0 = z0.to(device=p.device)
-                    m0 = state["momentum_buffer"].lerp(p.grad, 1 - group["momentum"])
-                    if group["nesterov"]:
-                        m0 = p.grad.lerp(m0, group["momentum"])
-                    X0 = m0.T if p.size(0) > p.size(1) else m0
-                    # Warm up the frame and the tail vector on the update this step orthogonalizes,
-                    # discarding the updates. A zero or non-finite update leaves them at their
-                    # random start.
-                    for _ in range(_WARMUP_STEPS):
-                        _echelon_step(
-                            X0,
-                            U0,
-                            z0,
-                            rank=rank,
-                            ns_coefficients=group["ns_coefficients"],
-                            ns_steps=group["ns_steps"],
-                            tau_iters=group["tau_iters"],
-                            margin=group["margin"],
-                            eps=group["eps"],
-                        )
                     state["subspace_frame"] = U0
                     state["tail_vec"] = z0
-                elif frame.dtype != torch.float32:
-                    # load_state_dict casts state to the parameter dtype by default.
-                    state["subspace_frame"] = frame.to(torch.float32)
-                    state["tail_vec"] = state["tail_vec"].to(torch.float32)
+                    # Warm up on the update this step orthogonalizes, discarding
+                    # the updates. A zero or non-finite update leaves the frame
+                    # at its random start and the warmup pending (see below).
+                    state["warmed"] = _warmup_frame(group, p, state, U0, z0, rank=rank)
+                else:
+                    if frame.dtype != torch.float32:
+                        # load_state_dict casts state to the parameter dtype by default.
+                        state["subspace_frame"] = frame.to(torch.float32)
+                        state["tail_vec"] = state["tail_vec"].to(torch.float32)
+                    if not state.get("warmed", True):
+                        # First finite, nonzero update since the frame was
+                        # created: warm up now, so it does not follow a random
+                        # frame. Checkpoints saved before the flag existed
+                        # (missing key) are treated as already warmed.
+                        state["warmed"] = _warmup_frame(
+                            group, p, state,
+                            state["subspace_frame"], state["tail_vec"], rank=rank,
+                        )
                 subspace_frames.append(state["subspace_frame"])
                 tail_vecs.append(state["tail_vec"])
             else:
@@ -447,6 +547,11 @@ class Echelon(Optimizer):
                 ns_coefficients=group["ns_coefficients"],
                 eps=group["eps"],
             )
+            # _validate_echelon_hyperparameters is deliberately not used here:
+            # its lr check on a CUDA tensor lr would add a host-device sync
+            # every step. adjust_lr_fn is a plain string, so checking it
+            # up front is sync-free.
+            _validate_adjust_lr_fn(group["adjust_lr_fn"])
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -491,6 +596,7 @@ class Echelon(Optimizer):
                 adjust_lr_fn=group["adjust_lr_fn"],
                 foreach=group["foreach"],
                 has_complex=has_complex,
+                _prevalidated=True,
             )
         return loss
 
@@ -553,12 +659,14 @@ Echelon.__doc__ = (
         and :func:`torch.set_float32_matmul_precision`); with TF32 or bfloat16 matmuls, the roundoff
         tail of a rank-deficient momentum is amplified (update spectral norm up to about 1.5 instead
         of 1.1). The first step warms up :math:`U` and :math:`z` on :math:`X_t`, discarding the
-        updates (a zero or non-finite first update leaves them at their random start); changing a
-        group's ``rank`` re-initializes them the same way at the next step, and parameters with
-        ``rank >= s`` drop them. ``subspace_frame`` and ``tail_vec`` are kept in
+        updates; a zero or non-finite first update leaves them at their random start and the
+        warmup pending, retried on the first finite, nonzero update (recorded in optimizer
+        state, so a checkpoint preserves it). Changing a group's ``rank`` re-initializes them
+        the same way at the next step, and parameters with ``rank >= s`` drop them. ``subspace_frame`` and ``tail_vec`` are kept in
         ``torch.float32``: if :meth:`load_state_dict` casts them to a low-precision parameter dtype,
         the next step converts them back (:func:`torch.optim.preserve_state_dtype_on_load` avoids the
-        round trip). DTensor parameters, for example under FSDP2, are not supported yet.
+        round trip). DTensor parameters, for example under FSDP2, are rejected with
+        ``NotImplementedError`` rather than failing inside the step.
         Defaults (``lr=1e-3``, ``weight_decay=0.1``) mirror :class:`torch.optim.Muon`;
         the Echelon blog post uses ``lr=0.02``, ``weight_decay=0.0``, and ``rank = max(64, width // 16)``.
 
@@ -626,6 +734,7 @@ def _check_echelon_inputs(
     ns_steps: int,
     eps: float,
     has_complex: bool,
+    validate_options: bool = True,
 ) -> None:
     if has_complex:
         raise RuntimeError("Echelon does not support complex parameters")
@@ -639,15 +748,21 @@ def _check_echelon_inputs(
         raise ValueError(
             "params, grads, momentum_bufs, subspace_frames, and tail_vecs must have matching lengths"
         )
-    _validate_echelon_options(
-        rank=rank,
-        tau_iters=tau_iters,
-        margin=margin,
-        ns_steps=ns_steps,
-        ns_coefficients=ns_coefficients,
-        eps=eps,
-    )
+    if validate_options:
+        _validate_echelon_options(
+            rank=rank,
+            tau_iters=tau_iters,
+            margin=margin,
+            ns_steps=ns_steps,
+            ns_coefficients=ns_coefficients,
+            eps=eps,
+        )
     for i, (param, grad, buf) in enumerate(zip(params, grads, momentum_bufs)):
+        if _is_dtensor(param) or _is_dtensor(grad) or _is_dtensor(buf):
+            raise NotImplementedError(
+                "Echelon does not support DTensor parameters "
+                "(for example under FSDP2)"
+            )
         if torch.is_complex(param) or torch.is_complex(grad) or torch.is_complex(buf):
             raise RuntimeError("Echelon does not support complex parameters")
         if grad.is_sparse:
@@ -689,6 +804,7 @@ def _single_tensor_echelon(
     eps: float,
     adjust_lr_fn: str | None,
     has_complex: bool,
+    _prevalidated: bool = False,
 ) -> None:
     _check_echelon_inputs(
         params,
@@ -703,6 +819,7 @@ def _single_tensor_echelon(
         ns_steps=ns_steps,
         eps=eps,
         has_complex=has_complex,
+        validate_options=not _prevalidated,
     )
 
     lr_val = _to_scalar(lr)
@@ -732,7 +849,7 @@ def _single_tensor_echelon(
 
         adjusted_lr = _adjust_lr(lr_val, adjust_lr_fn, param.shape)
         param.mul_(1 - lr_val * weight_decay)
-        param.add_(O.to(dtype=param.dtype), alpha=-adjusted_lr)
+        param.add_(O, alpha=-adjusted_lr)
 
 
 def _multi_tensor_echelon(
@@ -754,6 +871,7 @@ def _multi_tensor_echelon(
     eps: float,
     adjust_lr_fn: str | None,
     has_complex: bool,
+    _prevalidated: bool = False,
 ) -> None:
     if len(params) == 0:
         return
@@ -770,6 +888,7 @@ def _multi_tensor_echelon(
         ns_steps=ns_steps,
         eps=eps,
         has_complex=has_complex,
+        validate_options=not _prevalidated,
     )
 
     lr_val = _to_scalar(lr)
@@ -810,7 +929,7 @@ def _multi_tensor_echelon(
                 for j, X, U, z in zip(js, Xs, frames, tails):
                     O = _echelon_step(X, U, z, **step_kwargs)
                     p = device_params[j]
-                    p.add_((O.mT if transposed else O).to(p.dtype), alpha=-adjusted_lr)
+                    p.add_(O.mT if transposed else O, alpha=-adjusted_lr)
                 continue
 
             low_rank = rank < min(shape)
@@ -833,10 +952,8 @@ def _multi_tensor_echelon(
                 chunk_params = [device_params[j] for j in js[c : c + chunk]]
                 torch._foreach_add_(
                     chunk_params,
-                    [
-                        (o.mT if transposed else o).to(p.dtype)
-                        for o, p in zip(O.unbind(0), chunk_params)
-                    ],
+                    [o.mT if transposed else o
+                     for o, p in zip(O.unbind(0), chunk_params)],
                     alpha=-adjusted_lr,
                 )
 
@@ -862,8 +979,18 @@ def echelon(
     eps: float,
     adjust_lr_fn: str | None,
     has_complex: bool,
+    _prevalidated: bool = False,
 ) -> None:
-    _validate_adjust_lr_fn(adjust_lr_fn)
+    if not _prevalidated:
+        _validate_adjust_lr_fn(adjust_lr_fn)
+        _validate_echelon_options(
+            rank=rank,
+            tau_iters=tau_iters,
+            margin=margin,
+            ns_steps=ns_steps,
+            ns_coefficients=ns_coefficients,
+            eps=eps,
+        )
     if foreach is None:
         _, foreach = _default_to_fused_or_foreach(
             params, differentiable=False, use_fused=False
@@ -894,6 +1021,7 @@ def echelon(
         eps=eps,
         adjust_lr_fn=adjust_lr_fn,
         has_complex=has_complex,
+        _prevalidated=True,
     )
 
 
@@ -908,9 +1036,10 @@ echelon.__doc__ = (
     Both are updated in place and should be ``torch.float32``: a lower-precision frame is
     rounded to its dtype again at every step. Their shapes are checked, but not that the frame
     is orthonormal or that the tail vector is nonzero. Valid starting values are
-    ``torch.linalg.qr(torch.randn(s, rank, device=p.device, dtype=torch.float32))[0]`` and
+    ``torch.linalg.qr(torch.randn(s, rank, device=p.device, dtype=torch.float32))[0].contiguous()`` and
     ``torch.randn(l, 1, device=p.device, dtype=torch.float32)``. :class:`Echelon` also warms them up
-    on the first step's update; without that warmup the first updates follow a random frame
+    on the first step's update (deferred to the first finite, nonzero update if that
+    update is zero or non-finite); without that warmup the first updates follow a random frame
     and can overshoot. When ``rank >= s``, ``None`` may be passed for both entries.
 """
 )
