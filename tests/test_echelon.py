@@ -265,16 +265,47 @@ class TestEchelon:
             opt_ac.step()
         assert_close(p_ac, p_ref)
 
-    def test_foreach_not_supported_yet(self):
-        p = Parameter(torch.randn(8, 12, dtype=torch.float32))
-        p.grad = torch.randn_like(p)
-        with pytest.raises(RuntimeError, match="Foreach is not supported"):
-            echelon(
-                [p], [p.grad], [torch.zeros_like(p)], [None], [None],
-                foreach=True, lr=0.01, weight_decay=0.0, momentum=0.95,
-                nesterov=True, rank=2, tau_iters=2, margin=1.05,
-                ns_coefficients=NS_COEFFS, ns_steps=5, eps=1e-7,
-                adjust_lr_fn=None, has_complex=False)
+    def test_foreach_matches_forloop_on_batched_shapes(self):
+        # Same-shape params are stepped as one batch with Cholesky-QR, including a
+        # zero-gradient member, an NS-only (rank >= short side) group and an empty param.
+        torch.manual_seed(2)
+        shapes = [(24, 16)] * 3 + [(16, 24)] * 2 + [(4, 6)] * 2 + [(0, 5)]
+        base = [torch.randn(s, dtype=torch.float32) for s in shapes]
+        p_loop = [Parameter(b.clone()) for b in base]
+        p_each = [Parameter(b.clone()) for b in base]
+        kwargs = {"lr": 0.02, "weight_decay": 0.01, "rank": 4}
+        opt_loop = Echelon(p_loop, foreach=False, **kwargs)
+        opt_each = Echelon(p_each, foreach=True, **kwargs)
+        for _ in range(5):
+            for i, (a, b) in enumerate(zip(p_loop, p_each)):
+                a.grad = torch.zeros_like(a) if i == 2 else torch.randn_like(a)
+                b.grad = a.grad.clone()
+            opt_loop.step()
+            opt_each.step()
+        assert_close(p_each[2], base[2] * (1 - 0.02 * 0.01) ** 5)
+        eye = torch.eye(4, dtype=torch.float32)
+        for a, b in zip(p_loop, p_each):
+            assert_close(a, b)
+            if "subspace_frame" in opt_loop.state[a]:
+                u_a = opt_loop.state[a]["subspace_frame"]
+                u_b = opt_each.state[b]["subspace_frame"]
+                assert_close(u_b.T @ u_b, eye)
+                assert_close(u_a @ u_a.T, u_b @ u_b.T, atol=1e-4, rtol=1e-4)
+
+    def test_foreach_rank_deficient_momentum_stays_finite(self):
+        # Rank-4 momenta make the batched Cholesky-QR fail on CUDA; those params keep their frame.
+        torch.manual_seed(0)
+        params = [Parameter(torch.randn(512, 2048, dtype=torch.float32)) for _ in range(2)]
+        before = [p.detach().clone() for p in params]
+        opt = Echelon(params, rank=64, foreach=True)
+        for _ in range(4):
+            for p in params:
+                p.grad = torch.randn(512, 4) @ torch.randn(4, 2048)
+            opt.step()
+        for p, p0 in zip(params, before):
+            assert torch.isfinite(p).all()
+            assert torch.isfinite(opt.state[p]["subspace_frame"]).all()
+            assert (p - p0).abs().max().item() > 0.0
 
 
 class TestEchelonArgumentValidation:

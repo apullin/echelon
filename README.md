@@ -74,8 +74,8 @@ uv run --no-sync pytest
 
 ## Status
 
-- `0.1.0`: the unbatched (for-loop) optimizer from PR #205345.
-- Batched `foreach` path: see the commit history.
+- `0.1.0`: the unbatched (for-loop) optimizer from PR #205345, plus the
+  batched `foreach` path from internal diff D132660022 (second commit).
 - Known limitations are documented in `Echelon`'s docstring (DTensor,
   TF32 matmul precision, cold start after a zero/non-finite first update
   until the first finite, nonzero update warms the frame up).

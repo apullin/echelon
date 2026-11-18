@@ -3,8 +3,10 @@
 """Implementation of the Echelon optimizer."""
 
 import math
-from collections.abc import Iterator, MutableMapping
+from collections import defaultdict
+from collections.abc import Callable, Iterator, MutableMapping
 from contextlib import contextmanager
+from typing import cast
 
 import torch
 from torch import Tensor
@@ -24,7 +26,9 @@ try:
     # Same helpers torch.optim.Muon uses internally; fall back to local
     # equivalents on torch versions that do not expose them.
     from torch.optim.optimizer import (
+        _default_to_fused_or_foreach,
         _disable_dynamo_if_unsupported,
+        _foreach_doc,
         _functional_api_doc,
         _params_doc,
         _to_scalar,
@@ -46,6 +50,10 @@ except ImportError:  # pragma: no cover
         "The caller must initialize and retain optimizer state."
     )
     _params_doc = "params (iterable): iterable of Tensors or dicts defining parameter groups"
+    _foreach_doc = "foreach (bool, optional): whether to use the foreach implementation (default: None, which defaults to foreach on CUDA)."
+    def _default_to_fused_or_foreach(params, differentiable=False, use_fused=False):  # type: ignore[no-redef]
+        foreach = any(p.is_cuda for p in params)
+        return False, foreach
     def _to_scalar(x):  # type: ignore[no-redef]
         return x.squeeze() if isinstance(x, Tensor) and x.dim() != 0 else x
 
@@ -63,6 +71,12 @@ _WARMUP_STEPS = 3
 _TAU_FLOOR_MULT = 16.0
 _TINY = 1e-30
 _FP32_EPS = torch.finfo(torch.float32).eps
+# Relative diagonal shift of the shifted Cholesky-QR used by the batched (foreach) path.
+_CHOLESKY_QR_SHIFT = 1e-6
+# The foreach path batches same-shape matrices up to this many elements; larger ones gain
+# little from batching and would pay for a stacked copy.
+_FOREACH_MAX_NUMEL = 2**22
+_FOREACH_MAX_BATCH_NUMEL = 2**26
 
 
 @contextmanager
@@ -80,20 +94,51 @@ def _quintic_newton_schulz(
     ns_coefficients: tuple[float, float, float],
     ns_steps: int,
 ) -> Tensor:
-    """Apply `ns_steps` odd-quintic Newton-Schulz iterations on pre-normalized `X` (`rows <= cols`)."""
+    """Apply `ns_steps` odd-quintic Newton-Schulz iterations on pre-normalized `X` (`... x rows x cols`, `rows <= cols`)."""
     a, b, c = ns_coefficients
+    mm_add = torch.addmm if X.ndim == 2 else torch.baddbmm
     for _ in range(ns_steps):
         A = X @ X.mT
-        B = torch.addmm(A, A, A, beta=b, alpha=c)
-        X = torch.addmm(X, B, X, beta=a)
+        B = mm_add(A, A, A, beta=b, alpha=c)
+        X = mm_add(X, B, X, beta=a)
     return X
 
 
-def _subspace_step(X: Tensor, U: Tensor) -> Tensor:
-    """One subspace power step `U <- orth(X X^T U)` as two QR half-steps."""
-    V, _ = torch.linalg.qr(X.mT @ U, mode="reduced")
-    U_next, _ = torch.linalg.qr(X @ V, mode="reduced")
-    return U_next
+def _householder_qr(Y: Tensor) -> Tensor:
+    """Orthonormal basis of the columns of `Y`, signed so that `R` has a nonnegative diagonal."""
+    Q, R = torch.linalg.qr(Y, mode="reduced")
+    signs = torch.where(R.diagonal(dim1=-2, dim2=-1) < 0, -1.0, 1.0).to(Q.dtype)
+    return Q * signs.unsqueeze(-2)
+
+
+def _cholesky_qr2(Y: Tensor) -> Tensor:
+    """Orthonormalize the columns of `Y` (`... x n x r`) with two shifted Cholesky-QR passes.
+
+    Unlike Householder QR, this is a few GEMMs plus batched `r x r` solves, so it stays cheap when
+    batched over many matrices. Directions missing from a rank-deficient `Y` come out near zero
+    rather than as an arbitrary orthonormal completion, and regrow once the momentum excites them.
+    A rank-deficient or very ill-conditioned `Y` can still leave the shifted Gram matrix indefinite
+    after float32 roundoff; such entries come out as NaN.
+    """
+    eye = torch.eye(Y.size(-1), dtype=Y.dtype, device=Y.device)
+    for _ in range(2):
+        G = Y.mT @ Y
+        mean_diag = G.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None]
+        shift = (_CHOLESKY_QR_SHIFT * mean_diag).clamp_min(_TINY) * eye
+        L, info = torch.linalg.cholesky_ex(G + shift)
+        L = torch.where((info == 0)[..., None, None], L, torch.nan)
+        Y = torch.linalg.solve_triangular(L, Y.mT, upper=False).mT
+    return Y
+
+
+def _subspace_step(X: Tensor, U: Tensor, orth: Callable[[Tensor], Tensor]) -> Tensor:
+    """One subspace power step `U <- orth(X X^T U)` as two orthonormalized half-steps."""
+    return orth(X @ orth(X.mT @ U))
+
+
+def _frob_norm(X: Tensor) -> Tensor:
+    """Frobenius norm over the last two dims, kept for broadcasting."""
+    return torch.linalg.vector_norm(X, dim=(-2, -1), keepdim=True)
 
 
 def _echelon_step(
@@ -107,12 +152,13 @@ def _echelon_step(
     tau_iters: int,
     margin: float,
     eps: float,
+    orth: Callable[[Tensor], Tensor] = _householder_qr,
 ) -> Tensor:
-    """Compute Echelon update for short-side-first momentum `X` (`s x l`, `s <= l`), updating `U` and `z` in place."""
+    """Compute Echelon updates for short-side-first momenta `X` (`... x s x l`, `s <= l`), updating `U` and `z` in place."""
     with _disable_autocast(X.device.type):
         Xf = X.to(dtype=torch.float32)
-        s = Xf.size(0)
-        x_norm = torch.linalg.vector_norm(Xf)
+        s = Xf.size(-2)
+        x_norm = _frob_norm(Xf)
         denom = x_norm.clamp_min(eps) if eps > 0.0 else x_norm
         if rank >= s:
             return _quintic_newton_schulz(
@@ -129,12 +175,14 @@ def _echelon_step(
         X_unit = Xf / x_norm.clamp_min(_TINY)
         Uf = U.to(dtype=torch.float32)
 
-        # 1. Refresh tracked top-r subspace: V = orth(X^T U), U = orth(X V)
-        Uf = torch.where(active, _subspace_step(X_unit, Uf), Uf)
+        # 1. Refresh tracked top-r subspace: V = orth(X^T U), U = orth(X V), keeping U if orth failed
+        U_next = _subspace_step(X_unit, Uf, orth)
+        refresh = active & torch.isfinite(U_next).all(dim=(-2, -1), keepdim=True)
+        Uf = torch.where(refresh, U_next, Uf)
 
         # 2. Head: H = U^T X, P = NS5(H)
         H = Uf.mT @ X_unit
-        H_norm = torch.linalg.vector_norm(H)
+        H_norm = _frob_norm(H)
         P = _quintic_newton_schulz(
             (H / H_norm.clamp_min(_TINY)) * scale, ns_coefficients, ns_steps
         )
@@ -142,17 +190,17 @@ def _echelon_step(
         # 3. Tail: T = X - U H (re-projected once to keep U^T T = 0 to fp32 precision)
         T = X_unit - Uf @ H
         T = T - Uf @ (Uf.mT @ T)
-        t_frob = torch.linalg.vector_norm(T)
+        t_frob = _frob_norm(T)
         tau_floor = _TAU_FLOOR_MULT * math.sqrt(s) * _FP32_EPS * H_norm
 
         zf = z.to(dtype=torch.float32)
-        z_cur = zf / torch.linalg.vector_norm(zf).clamp_min(_TINY)
+        z_cur = zf / _frob_norm(zf).clamp_min(_TINY)
         est = torch.zeros_like(x_norm)
         for _ in range(tau_iters):
             w = T @ z_cur
-            est = torch.linalg.vector_norm(w)
+            est = _frob_norm(w)
             z_next = T.mT @ w
-            z_next_norm = torch.linalg.vector_norm(z_next)
+            z_next_norm = _frob_norm(z_next)
             z_cur = torch.where(
                 z_next_norm > 0, z_next / z_next_norm.clamp_min(_TINY), z_cur
             )
@@ -230,6 +278,7 @@ class Echelon(Optimizer):
         eps: float = EPS,
         ns_steps: int = DEFAULT_NS_STEPS,
         adjust_lr_fn: str | None = None,
+        foreach: bool | None = None,
     ) -> None:
         _validate_echelon_hyperparameters(
             lr=lr,
@@ -258,6 +307,7 @@ class Echelon(Optimizer):
             "eps": eps,
             "ns_steps": ns_steps,
             "adjust_lr_fn": adjust_lr_fn,
+            "foreach": foreach,
         }
         super().__init__(params, defaults)
 
@@ -439,6 +489,7 @@ class Echelon(Optimizer):
                 eps=group["eps"],
                 ns_steps=group["ns_steps"],
                 adjust_lr_fn=group["adjust_lr_fn"],
+                foreach=group["foreach"],
                 has_complex=has_complex,
             )
         return loss
@@ -536,6 +587,11 @@ Echelon.__doc__ = (
             (default: {DEFAULT_NS_STEPS}).
         adjust_lr_fn (str, optional): learning-rate scaling rule. One of ``"original"``,
             ``"match_rms_adamw"``, or ``"spectral_unclamped"`` (default: None, equivalent to ``"original"``).
+        {_foreach_doc} The foreach implementation batches same-shape parameters of up to
+            :math:`2^{{22}}` elements and orthonormalizes them with shifted Cholesky-QR instead of
+            Householder QR; larger parameters are stepped one at a time. A parameter whose
+            Cholesky factorization fails (rank-deficient or very ill-conditioned momentum) keeps
+            its previous frame for that step.
 
     Example:
         >>> # xdoctest: +SKIP
@@ -556,24 +612,19 @@ Echelon.__doc__ = (
 )
 
 
-def _single_tensor_echelon(
+def _check_echelon_inputs(
     params: list[Tensor],
     grads: list[Tensor],
     momentum_bufs: list[Tensor],
     subspace_frames: list[Tensor | None],
     tail_vecs: list[Tensor | None],
     *,
-    lr: float,
-    weight_decay: float,
-    momentum: float,
-    nesterov: bool,
     rank: int,
     tau_iters: int,
     margin: float,
     ns_coefficients: tuple[float, float, float],
     ns_steps: int,
     eps: float,
-    adjust_lr_fn: str | None,
     has_complex: bool,
 ) -> None:
     if has_complex:
@@ -618,6 +669,42 @@ def _single_tensor_echelon(
                     f"got {tuple(u_i.shape)} and {tuple(z_i.shape)}"
                 )
 
+
+def _single_tensor_echelon(
+    params: list[Tensor],
+    grads: list[Tensor],
+    momentum_bufs: list[Tensor],
+    subspace_frames: list[Tensor | None],
+    tail_vecs: list[Tensor | None],
+    *,
+    lr: float,
+    weight_decay: float,
+    momentum: float,
+    nesterov: bool,
+    rank: int,
+    tau_iters: int,
+    margin: float,
+    ns_coefficients: tuple[float, float, float],
+    ns_steps: int,
+    eps: float,
+    adjust_lr_fn: str | None,
+    has_complex: bool,
+) -> None:
+    _check_echelon_inputs(
+        params,
+        grads,
+        momentum_bufs,
+        subspace_frames,
+        tail_vecs,
+        rank=rank,
+        tau_iters=tau_iters,
+        margin=margin,
+        ns_coefficients=ns_coefficients,
+        ns_steps=ns_steps,
+        eps=eps,
+        has_complex=has_complex,
+    )
+
     lr_val = _to_scalar(lr)
     for i, param in enumerate(params):
         grad = grads[i]
@@ -648,6 +735,112 @@ def _single_tensor_echelon(
         param.add_(O.to(dtype=param.dtype), alpha=-adjusted_lr)
 
 
+def _multi_tensor_echelon(
+    params: list[Tensor],
+    grads: list[Tensor],
+    momentum_bufs: list[Tensor],
+    subspace_frames: list[Tensor | None],
+    tail_vecs: list[Tensor | None],
+    *,
+    lr: float,
+    weight_decay: float,
+    momentum: float,
+    nesterov: bool,
+    rank: int,
+    tau_iters: int,
+    margin: float,
+    ns_coefficients: tuple[float, float, float],
+    ns_steps: int,
+    eps: float,
+    adjust_lr_fn: str | None,
+    has_complex: bool,
+) -> None:
+    if len(params) == 0:
+        return
+    _check_echelon_inputs(
+        params,
+        grads,
+        momentum_bufs,
+        subspace_frames,
+        tail_vecs,
+        rank=rank,
+        tau_iters=tau_iters,
+        margin=margin,
+        ns_coefficients=ns_coefficients,
+        ns_steps=ns_steps,
+        eps=eps,
+        has_complex=has_complex,
+    )
+
+    lr_val = _to_scalar(lr)
+    step_kwargs = {
+        "rank": rank,
+        "ns_coefficients": ns_coefficients,
+        "ns_steps": ns_steps,
+        "tau_iters": tau_iters,
+        "margin": margin,
+        "eps": eps,
+    }
+    grouped_tensors = Optimizer._group_tensors_by_device_and_dtype(
+        [params, grads, momentum_bufs], with_indices=True
+    )
+    for (device_params, device_grads, device_bufs), indices in grouped_tensors.values():
+        torch._foreach_lerp_(device_bufs, device_grads, 1 - momentum)
+        updates = (
+            torch._foreach_lerp(device_grads, device_bufs, momentum)
+            if nesterov
+            else device_bufs
+        )
+        torch._foreach_mul_(device_params, 1 - lr_val * weight_decay)
+
+        # Under torch.compile, _group_tensors_by_device_and_dtype returns a single group, so
+        # batches are keyed by device and dtype as well.
+        batches: dict[tuple[torch.device, torch.dtype, torch.Size], list[int]]
+        batches = defaultdict(list)
+        for j, p in enumerate(device_params):
+            if p.numel() > 0:
+                batches[(p.device, p.dtype, p.shape)].append(j)
+        for (_, _, shape), js in batches.items():
+            transposed = shape[0] > shape[1]
+            adjusted_lr = _adjust_lr(lr_val, adjust_lr_fn, shape)
+            frames = [subspace_frames[indices[j]] for j in js]
+            tails = [tail_vecs[indices[j]] for j in js]
+            Xs = [updates[j].mT if transposed else updates[j] for j in js]
+            if len(js) == 1 or shape.numel() > _FOREACH_MAX_NUMEL:
+                for j, X, U, z in zip(js, Xs, frames, tails):
+                    O = _echelon_step(X, U, z, **step_kwargs)
+                    p = device_params[j]
+                    p.add_((O.mT if transposed else O).to(p.dtype), alpha=-adjusted_lr)
+                continue
+
+            low_rank = rank < min(shape)
+            chunk = max(1, _FOREACH_MAX_BATCH_NUMEL // shape.numel())
+            for c in range(0, len(js), chunk):
+                chunk_frames = cast(list[Tensor], frames[c : c + chunk])
+                chunk_tails = cast(list[Tensor], tails[c : c + chunk])
+                U = torch.stack(chunk_frames) if low_rank else None
+                z = torch.stack(chunk_tails) if low_rank else None
+                O = _echelon_step(
+                    torch.stack(Xs[c : c + chunk]),
+                    U,
+                    z,
+                    orth=_cholesky_qr2,
+                    **step_kwargs,
+                )
+                if U is not None and z is not None:
+                    torch._foreach_copy_(chunk_frames, list(U.unbind(0)))
+                    torch._foreach_copy_(chunk_tails, list(z.unbind(0)))
+                chunk_params = [device_params[j] for j in js[c : c + chunk]]
+                torch._foreach_add_(
+                    chunk_params,
+                    [
+                        (o.mT if transposed else o).to(p.dtype)
+                        for o, p in zip(O.unbind(0), chunk_params)
+                    ],
+                    alpha=-adjusted_lr,
+                )
+
+
 @_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_echelon)
 def echelon(
     params: list[Tensor],
@@ -671,10 +864,19 @@ def echelon(
     has_complex: bool,
 ) -> None:
     _validate_adjust_lr_fn(adjust_lr_fn)
-    if foreach is not None and foreach:
-        raise RuntimeError("Foreach is not supported for Echelon yet")
+    if foreach is None:
+        _, foreach = _default_to_fused_or_foreach(
+            params, differentiable=False, use_fused=False
+        )
+    if foreach and torch.jit.is_scripting():
+        raise RuntimeError("torch.jit.script not supported with foreach optimizers")
 
-    _single_tensor_echelon(
+    func = (
+        _multi_tensor_echelon
+        if foreach and not torch.jit.is_scripting()
+        else _single_tensor_echelon
+    )
+    func(
         params,
         grads,
         momentum_bufs,
