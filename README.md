@@ -92,6 +92,12 @@ uv run --no-sync pytest
 
 ## Benchmarks
 
+`benchmarks/bench_gpu.py` is the GPU correctness + perf script; it
+can only run on a GPU OD -- see `docs/gpu-od.md` for the runbook
+(it cannot be driven from the sandboxed laptop session, and GPU
+remote execution only runs buck targets in fbsource, whose copy of
+the optimizer is stale).
+
 `benchmarks/bench_cpu.py` measures `step()`-only time on CPU and
 `benchmarks/cpu_results.md` records a laptop run, with its caveats
 (CPU QR costs and Muon's bf16 CPU GEMMs do not transfer to GPU).
