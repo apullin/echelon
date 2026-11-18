@@ -4,9 +4,9 @@
 
 import math
 from collections import defaultdict
-from collections.abc import Callable, Iterator, MutableMapping
+from collections.abc import Callable, Iterable, Iterator, MutableMapping
 from contextlib import contextmanager, nullcontext
-from typing import cast
+from typing import Any, TypeAlias, cast
 
 import torch
 from torch import Tensor
@@ -57,7 +57,7 @@ except ImportError:  # pragma: no cover
     def _to_scalar(x):  # type: ignore[no-redef]
         return x.squeeze() if isinstance(x, Tensor) and x.dim() != 0 else x
 
-ParamsT = "Iterable[Tensor] | Iterable[dict]"
+ParamsT: TypeAlias = Iterable[Tensor] | Iterable[dict[str, Any]]
 
 
 
@@ -97,6 +97,7 @@ _CHOLESKY_QR_SHIFT = 1e-6
 # little from batching and would pay for a stacked copy.
 _FOREACH_MAX_NUMEL = 2**22
 _FOREACH_MAX_BATCH_NUMEL = 2**26
+_EYES: dict[tuple[int, torch.dtype, torch.device], Tensor] = {}
 
 
 @contextmanager
@@ -140,7 +141,12 @@ def _cholesky_qr2(Y: Tensor) -> Tensor:
     A rank-deficient or very ill-conditioned `Y` can still leave the shifted Gram matrix indefinite
     after float32 roundoff; such entries come out as NaN.
     """
-    eye = torch.eye(Y.size(-1), dtype=Y.dtype, device=Y.device)
+    # The shift matrix is read-only, so cache it per (size, dtype, device).
+    _eye_key = (Y.size(-1), Y.dtype, Y.device)
+    eye = _EYES.get(_eye_key)
+    if eye is None:
+        eye = torch.eye(Y.size(-1), dtype=Y.dtype, device=Y.device)
+        _EYES[_eye_key] = eye
     for _ in range(2):
         G = Y.mT @ Y
         mean_diag = G.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None]
@@ -312,10 +318,25 @@ def _validate_echelon_options(
         raise ValueError(
             f"ns_steps must be an integer in [1, 100) for computational efficiency, got: {ns_steps!r}"
         )
-    if len(ns_coefficients) != 3:
-        raise ValueError("Coefficients must be a tuple of exactly 3 values")
+    try:
+        _coeffs = [float(c) for c in ns_coefficients]  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Coefficients must be a tuple of exactly 3 finite numbers, "
+            f"got: {ns_coefficients!r}"
+        ) from None
+    if len(_coeffs) != 3 or not all(math.isfinite(c) for c in _coeffs):
+        raise ValueError(
+            "Coefficients must be a tuple of exactly 3 finite numbers, "
+            f"got: {ns_coefficients!r}"
+        )
     if not 0.0 <= eps:
         raise ValueError(f"eps should be >= 0 but is: {eps}")
+
+
+def _validate_foreach(foreach: bool | None) -> None:
+    if foreach is not None and not isinstance(foreach, bool):
+        raise ValueError(f"foreach must be True, False, or None, got: {foreach!r}")
 
 
 def _warmup_frame(
@@ -356,6 +377,31 @@ def _warmup_frame(
     return active
 
 
+def _check_group_inputs(group: MutableMapping) -> None:
+    """Reject DTensor/complex/sparse/non-2D inputs before any group is stepped.
+
+    ``Echelon.step`` calls this for every group up front: the per-group
+    checks in ``_init_group`` run after earlier groups have already been
+    stepped, so a bad input in a later group would otherwise leave the
+    earlier groups stepped for one gradient (the same partial-step failure
+    the up-front option validation exists to prevent).
+    """
+    for p in group["params"]:
+        if _is_dtensor(p):
+            raise NotImplementedError(
+                "Echelon does not support DTensor parameters "
+                "(for example under FSDP2)"
+            )
+        if p.ndim != 2:
+            raise ValueError(
+                f"Echelon only supports 2D parameters whereas we found a parameter with size: {p.size()}"
+            )
+        if torch.is_complex(p):
+            raise RuntimeError("Echelon does not support complex parameters")
+        if p.grad is not None and p.grad.is_sparse:
+            raise RuntimeError("Echelon does not support sparse gradients")
+
+
 class Echelon(Optimizer):
     def __init__(
         self,
@@ -388,6 +434,7 @@ class Echelon(Optimizer):
             ns_coefficients=ns_coefficients,
             eps=eps,
         )
+        _validate_foreach(foreach)
 
         defaults = {
             "lr": lr,
@@ -434,6 +481,7 @@ class Echelon(Optimizer):
                 ns_coefficients=group["ns_coefficients"],
                 eps=group["eps"],
             )
+            _validate_foreach(group["foreach"])
             for p in group["params"]:
                 if _is_dtensor(p):
                     raise NotImplementedError(
@@ -442,7 +490,9 @@ class Echelon(Optimizer):
                     )
                 if p.ndim != 2:
                     raise ValueError(
-                        f"Echelon only supports 2D parameters whereas we found a parameter with size: {p.size()}"
+                        f"Echelon only supports 2D parameters whereas we found a parameter with size: {p.size()}. "
+                        "Pass only 2D hidden weights to Echelon (see echelon.partition_parameters) "
+                        "and use another optimizer, e.g. AdamW, for the rest."
                     )
         except Exception:
             self.param_groups.pop()
@@ -552,6 +602,8 @@ class Echelon(Optimizer):
             # every step. adjust_lr_fn is a plain string, so checking it
             # up front is sync-free.
             _validate_adjust_lr_fn(group["adjust_lr_fn"])
+            _validate_foreach(group["foreach"])
+            _check_group_inputs(group)
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -664,7 +716,7 @@ Echelon.__doc__ = (
         state, so a checkpoint preserves it). Changing a group's ``rank`` re-initializes them
         the same way at the next step, and parameters with ``rank >= s`` drop them. ``subspace_frame`` and ``tail_vec`` are kept in
         ``torch.float32``: if :meth:`load_state_dict` casts them to a low-precision parameter dtype,
-        the next step converts them back (:func:`torch.optim.preserve_state_dtype_on_load` avoids the
+        the next step converts them back (a state-dtype-preserving load avoids the
         round trip). DTensor parameters, for example under FSDP2, are rejected with
         ``NotImplementedError`` rather than failing inside the step.
         Defaults (``lr=1e-3``, ``weight_decay=0.1``) mirror :class:`torch.optim.Muon`;
@@ -953,7 +1005,7 @@ def _multi_tensor_echelon(
                 torch._foreach_add_(
                     chunk_params,
                     [o.mT if transposed else o
-                     for o, p in zip(O.unbind(0), chunk_params)],
+                     for o, _p in zip(O.unbind(0), chunk_params)],
                     alpha=-adjusted_lr,
                 )
 
@@ -983,6 +1035,7 @@ def echelon(
 ) -> None:
     if not _prevalidated:
         _validate_adjust_lr_fn(adjust_lr_fn)
+        _validate_foreach(foreach)
         _validate_echelon_options(
             rank=rank,
             tau_iters=tau_iters,

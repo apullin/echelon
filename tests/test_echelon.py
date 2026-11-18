@@ -370,6 +370,31 @@ class TestEchelonArgumentValidation:
                     adjust_lr_fn="match_rms_adam", has_complex=False,
                     rank=4, tau_iters=2, margin=1.05)
 
+    def test_constructor_rejects_nonfinite_ns_coefficients(self):
+        for bad in ((float("nan"), 0.0, 0.0), ("a", 0.0, 0.0), (1.0, 2.0)):
+            with pytest.raises(ValueError, match="exactly 3 finite numbers"):
+                Echelon([Parameter(torch.zeros(4, 4))], ns_coefficients=bad)
+
+    def test_constructor_rejects_non_bool_foreach(self):
+        for bad in ("yes", 1):
+            with pytest.raises(ValueError, match="foreach must be"):
+                Echelon([Parameter(torch.zeros(4, 4))], foreach=bad)
+
+    def test_sparse_grad_in_later_group_steps_no_group(self):
+        # Like test_invalid_group_option_steps_no_group, but the bad
+        # input is discovered in _init_group: it must not leave the
+        # earlier group stepped either.
+        p0 = Parameter(torch.randn(8, 12, dtype=torch.float32))
+        p1 = Parameter(torch.randn(8, 12, dtype=torch.float32))
+        opt = Echelon([{"params": [p0]}, {"params": [p1]}], rank=2)
+        p0.grad = torch.randn_like(p0)
+        p1.grad = torch.randn_like(p1).to_sparse()
+        before = p0.detach().clone()
+        with pytest.raises(RuntimeError, match="sparse"):
+            opt.step()
+        assert_close(p0, before)
+        assert len(opt.state) == 0
+
     def test_constructor_rejects_non_2d_and_bad_options(self):
         with pytest.raises(ValueError, match="Echelon only supports 2D"):
             Echelon([Parameter(torch.zeros(4, 4, 4))])

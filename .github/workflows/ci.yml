@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU torch, pytest, and the package
+        run: |
+          uv venv
+          uv pip install --python .venv/bin/python \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple \
+            "torch>=2.9" pytest
+          uv pip install --python .venv/bin/python -e . --no-deps
+      - name: Run tests
+        run: uv run --no-sync pytest -q
+      - name: Run the example
+        run: uv run --no-sync python examples/train_toy.py

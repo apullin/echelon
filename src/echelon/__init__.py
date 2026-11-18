@@ -15,7 +15,16 @@ https://github.com/pytorch/pytorch/issues/205526). The API mirrors
 """
 
 from ._echelon import DEFAULT_MARGIN, DEFAULT_RANK, DEFAULT_TAU_ITERS, Echelon, echelon
+from .partition import echelon_adamw_pair, partition_parameters
 
-__all__ = ["Echelon", "echelon", "DEFAULT_RANK", "DEFAULT_TAU_ITERS", "DEFAULT_MARGIN"]
+__all__ = [
+    "Echelon",
+    "echelon",
+    "DEFAULT_RANK",
+    "DEFAULT_TAU_ITERS",
+    "DEFAULT_MARGIN",
+    "partition_parameters",
+    "echelon_adamw_pair",
+]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

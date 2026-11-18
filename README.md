@@ -20,26 +20,44 @@ largest singular value.
 
 ## Install
 
+The package is not on PyPI yet; install it from GitHub (this installs
+PyTorch too, if it is not already installed):
+
 ```sh
-pip install echelon-optimizer
+pip install "git+https://github.com/apullin/echelon.git"
 ```
 
-Requires Python ≥ 3.11 and PyTorch ≥ 2.6.
+Requires Python ≥ 3.11 and PyTorch ≥ 2.9.
 
 ## Usage
 
+`Echelon` only accepts 2D parameters, so the usual setup is two
+optimizers. The one-call version is `echelon_adamw_pair`, which
+partitions a model's parameters (2D matrices that are not embeddings
+or heads go to Echelon, everything else to AdamW) and builds both
+optimizers; step both each training step. See
+`examples/train_toy.py` for a complete runnable version.
+
 ```python
-from echelon import Echelon
+from echelon import echelon_adamw_pair
+
+opt_echelon, opt_adamw = echelon_adamw_pair(model)
+# ... loss.backward(); clip_grad_norm_(...); opt_echelon.step(); opt_adamw.step()
+```
+
+Or partition by hand, e.g. to use a different second optimizer:
+
+```python
+from echelon import Echelon, partition_parameters
 import torch
 
-hidden = [p for n, p in model.named_parameters()
-          if p.ndim == 2 and "embed" not in n and "head" not in n]
-other = [p for n, p in model.named_parameters()
-         if p.ndim != 2 or "embed" in n or "head" in n]
-
+hidden, rest = partition_parameters(model)  # exclude_substrings=("embed", "head")
 opt_echelon = Echelon(hidden, lr=0.02, weight_decay=0.0, rank=64)
-opt_adamw = torch.optim.AdamW(other, lr=3e-4, weight_decay=0.01)
+opt_adamw = torch.optim.AdamW(rest, lr=3e-4, weight_decay=0.01)
 ```
+
+Passing `model.parameters()` directly to `Echelon` raises a `ValueError`
+pointing at `partition_parameters`, rather than failing obscurely.
 
 The functional API mirrors `torch.optim.functional`:
 
@@ -67,15 +85,24 @@ All commands run in a [uv](https://docs.astral.sh/uv/) environment:
 ```sh
 uv venv
 uv pip install --index-url https://download.pytorch.org/whl/cpu \
-    --extra-index-url https://pypi.org/simple "torch>=2.6" pytest
+    --extra-index-url https://pypi.org/simple "torch>=2.9" pytest
 uv pip install -e . --no-deps
 uv run --no-sync pytest
 ```
 
+## Benchmarks
+
+`benchmarks/bench_cpu.py` measures `step()`-only time on CPU and
+`benchmarks/cpu_results.md` records a laptop run, with its caveats
+(CPU QR costs and Muon's bf16 CPU GEMMs do not transfer to GPU).
+There are no GPU benchmark numbers from this package yet.
+
 ## Status
 
-- `0.1.0`: the unbatched (for-loop) optimizer from PR #205345, plus the
-  batched `foreach` path from internal diff D132660022 (second commit).
+- `0.2.0`: the unbatched (for-loop) optimizer from PR #205345, plus the
+  batched `foreach` path from internal diff D132660022 (second commit),
+  plus `partition_parameters` / `echelon_adamw_pair` and the audit fixes
+  in the fourth commit.
 - The 9 non-blocking findings from the last automated review of PR #205345
   (0594e6e) are addressed in the third commit: up-front `adjust_lr_fn`
   validation, deferred warmup after a zero/non-finite first update,
