@@ -17,13 +17,14 @@ jobs:
           - python-version: "3.12"
             torch-spec: "torch>=2.9"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
+          cache-dependency-glob: "pyproject.toml"
       - name: Install CPU torch, dev tools, and the package
         run: |
-          uv venv
+          uv venv --clear
           uv pip install --python .venv/bin/python \
             --index-url https://download.pytorch.org/whl/cpu \
             --extra-index-url https://pypi.org/simple \
