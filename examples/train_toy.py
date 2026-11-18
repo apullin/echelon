@@ -4,13 +4,13 @@ Run from the repo root in the uv env (see README):
 
     uv run --no-sync python examples/train_toy.py
 
-On CPU this takes a few seconds and the loss should fall. The model is
-deliberately tiny; this is a usability smoke test, not a benchmark.
+On CPU this takes a few seconds and the loss should fall. Uses ``rank=8``
+on ``d=32`` hidden layers so the low-rank subspace/tail path is exercised.
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from echelon import echelon_adamw_pair
 
@@ -34,8 +34,11 @@ class ToyModel(nn.Module):
 def main() -> None:
     torch.manual_seed(0)
     model = ToyModel()
-    opt_echelon, opt_adamw = echelon_adamw_pair(model)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt_echelon, T_max=50)
+    opt_echelon, opt_adamw = echelon_adamw_pair(
+        model, echelon_kwargs={"rank": 8}
+    )
+    sched_echelon = torch.optim.lr_scheduler.CosineAnnealingLR(opt_echelon, T_max=50)
+    sched_adamw = torch.optim.lr_scheduler.CosineAnnealingLR(opt_adamw, T_max=50)
     data = torch.randint(0, 64, (32, 8))
     for step in range(20):
         opt_echelon.zero_grad()
@@ -48,7 +51,8 @@ def main() -> None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt_echelon.step()
         opt_adamw.step()
-        sched.step()
+        sched_echelon.step()
+        sched_adamw.step()
         if step % 5 == 0 or step == 19:
             print(f"step {step:2d}  loss {loss.item():.4f}")
     print("done")

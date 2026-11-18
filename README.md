@@ -33,9 +33,9 @@ Requires Python ≥ 3.11 and PyTorch ≥ 2.9.
 
 `Echelon` only accepts 2D parameters, so the usual setup is two
 optimizers. The one-call version is `echelon_adamw_pair`, which
-partitions a model's parameters (2D matrices that are not embeddings
-or heads go to Echelon, everything else to AdamW) and builds both
-optimizers; step both each training step. See
+partitions a model's trainable parameters (2D hidden matrices go to
+Echelon; embeddings, tied/untied output heads, norms, and biases go to
+AdamW) and builds both optimizers; step both each training step. See
 `examples/train_toy.py` for a complete runnable version.
 
 ```python
@@ -71,16 +71,22 @@ echelon(params, grads, momentum_bufs, subspace_frames, tail_vecs,
 
 `Echelon` supports 2D parameters only, intended for hidden-layer weights.
 DTensor parameters (e.g. under FSDP2) are not supported. The `foreach`
-implementation batches same-shape parameters and orthonormalizes them with
-shifted Cholesky-QR instead of Householder QR; larger parameters are stepped
-one at a time. See `Echelon`'s docstring for the full algorithm, defaults
-(`lr=1e-3`, `weight_decay=0.1`, mirroring Muon; the blog post uses
-`lr=0.02`, `weight_decay=0.0`, `rank = max(64, width // 16)`), and the
-TF32/autocast notes.
+implementation orthonormalizes with shifted Cholesky-QR2 (verified for
+orthonormality before updating the tracked frame) and batches same-shape
+parameters up to `2**22` elements per matrix; larger matrices are stepped
+one at a time without stacking. Steady-state `step()` has zero host-device
+synchronizations (including with 0D CUDA tensor learning rates) and is
+compatible with `torch.cuda.CUDAGraph` and `torch.compile`. See
+`Echelon`'s docstring for the full algorithm, defaults (`lr=1e-3`,
+`weight_decay=0.1`, mirroring Muon; the blog post uses `lr=0.02`,
+`weight_decay=0.0`, `rank = max(64, width // 16)`), and the TF32/autocast
+notes.
 
 ## Development
 
-All commands run in a [uv](https://docs.astral.sh/uv/) environment:
+All commands run in a [uv](https://docs.astral.sh/uv/) environment (omit
+`--index-url .../cpu` on a CUDA machine to install the CUDA wheel and run
+the full CPU + CUDA test suite):
 
 ```sh
 uv venv
@@ -92,19 +98,31 @@ uv run --no-sync pytest
 
 ## Benchmarks
 
-`benchmarks/bench_gpu.py` is the GPU correctness + perf script; it
-can only run on a GPU OD -- see `docs/gpu-od.md` for the runbook
-(it cannot be driven from the sandboxed laptop session, and GPU
-remote execution only runs buck targets in fbsource, whose copy of
-the optimizer is stale).
+`benchmarks/bench_gpu.py` runs GPU correctness checks and `step()`-only
+performance sweeps across transformer-block shapes (automatically sizing
+layer counts to fit available VRAM, from 16 GB workstation GPUs up to
+80 GB A100/H100s) and writes `benchmarks/gpu_results.md`. On an NVIDIA
+GeForce RTX 4080 (`torch 2.15.0+cu132`, TF32, `rank=64`), `foreach` gives
+`1.7x–3.7x` speedup over the for-loop path at widths `512–768`, and
+Echelon's `O(mnr)` scaling overtakes `torch.optim.Muon` around width
+`1536`, reaching `1.9x` faster at width `2048` and `2.5x` faster at width
+`4096`. See `benchmarks/gpu_results.md` for the full tables and
+`docs/gpu-od.md` for verification instructions.
 
 `benchmarks/bench_cpu.py` measures `step()`-only time on CPU and
 `benchmarks/cpu_results.md` records a laptop run, with its caveats
 (CPU QR costs and Muon's bf16 CPU GEMMs do not transfer to GPU).
-There are no GPU benchmark numbers from this package yet.
 
 ## Status
 
+- `0.3.0`: Council review & RTX 4080 GPU shakeout hardening — Cholesky-QR2
+  orthonormality gating, `L∞`-scaled overflow/underflow/`NaN`-safe
+  normalization, fused cuBLAS projections & per-chunk Nesterov updates
+  (25–42% lower peak `foreach` VRAM), sync-free CUDA tensor `lr` +
+  `CUDAGraph` / `torch.compile` support, lossless `float32` `load_state_dict`,
+  module/token-aware `partition_parameters` (tied weights, `wte`/`wpe`,
+  `output.weight`, `multihead_attn`), PEP 561 `py.typed`, and RTX 4080
+  benchmark numbers.
 - `0.2.0`: the unbatched (for-loop) optimizer from PR #205345, plus the
   batched `foreach` path from internal diff D132660022 (second commit),
   plus `partition_parameters` / `echelon_adamw_pair` and the audit fixes

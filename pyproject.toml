@@ -4,12 +4,22 @@ build-backend = "hatchling.build"
 
 [project]
 name = "echelon-optimizer"
-version = "0.2.0"
+version = "0.3.0"
 description = "Echelon optimizer for PyTorch: rank-anchored spectral clipping"
 readme = "README.md"
 license = "BSD-3-Clause"
 requires-python = ">=3.11"
 authors = [{name = "Andrew Pullin"}]
+keywords = ["pytorch", "optimizer", "deep-learning", "muon", "spectral-clipping"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = ["torch>=2.9"]
 
 [project.urls]
@@ -17,7 +27,7 @@ Homepage = "https://github.com/apullin/echelon"
 Source = "https://github.com/apullin/echelon"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "mypy>=1.10", "ruff>=0.9", "setuptools"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/echelon"]

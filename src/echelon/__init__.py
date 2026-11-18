@@ -14,17 +14,22 @@ https://github.com/pytorch/pytorch/issues/205526). The API mirrors
 ``torch.optim.Muon`` so the two can be swapped for hidden-layer weights.
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from ._echelon import DEFAULT_MARGIN, DEFAULT_RANK, DEFAULT_TAU_ITERS, Echelon, echelon
 from .partition import echelon_adamw_pair, partition_parameters
 
 __all__ = [
-    "Echelon",
-    "echelon",
+    "DEFAULT_MARGIN",
     "DEFAULT_RANK",
     "DEFAULT_TAU_ITERS",
-    "DEFAULT_MARGIN",
-    "partition_parameters",
+    "Echelon",
+    "echelon",
     "echelon_adamw_pair",
+    "partition_parameters",
 ]
 
-__version__ = "0.2.0"
+try:
+    __version__ = version("echelon-optimizer")
+except PackageNotFoundError:
+    __version__ = "0.3.0"

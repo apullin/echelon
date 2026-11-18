@@ -10,17 +10,30 @@ from typing import Any, TypeAlias, cast
 
 import torch
 from torch import Tensor
+from torch.optim import Optimizer
 
 from ._muon_utils import (
-    _adjust_lr,
-    _validate_adjust_lr_fn,
     DEFAULT_A,
     DEFAULT_B,
     DEFAULT_C,
     DEFAULT_NS_STEPS,
     EPS,
+    _adjust_lr,
+    _validate_adjust_lr_fn,
 )
-from torch.optim import Optimizer
+
+_functional_api_doc = (
+    "Functional API that performs {optimizer} algorithm computation.\n\n"
+    "This function updates the provided parameters and optimizer state in place.\n"
+    "The caller must initialize and retain optimizer state."
+)
+_params_doc = (
+    "params (iterable): iterable of Tensors or dicts defining parameter groups"
+)
+_foreach_doc = (
+    "foreach (bool, optional): whether to use the foreach implementation "
+    "(default: None, which defaults to foreach on CUDA)."
+)
 
 try:
     # Same helpers torch.optim.Muon uses internally; fall back to local
@@ -28,15 +41,12 @@ try:
     from torch.optim.optimizer import (
         _default_to_fused_or_foreach,
         _disable_dynamo_if_unsupported,
-        _foreach_doc,
-        _functional_api_doc,
-        _params_doc,
         _to_scalar,
     )
 except ImportError:  # pragma: no cover
     from collections.abc import Callable as _Callable
 
-    def _disable_dynamo_if_unsupported(
+    def _disable_dynamo_if_unsupported(  # type: ignore[misc]
         single_tensor_fn: _Callable | None = None,
     ) -> _Callable:
         def wrap(fn: _Callable) -> _Callable:
@@ -44,22 +54,19 @@ except ImportError:  # pragma: no cover
 
         return wrap
 
-    _functional_api_doc = (
-        "Functional API that performs {optimizer} algorithm computation.\n\n"
-        "This function updates the provided parameters and optimizer state in place.\n"
-        "The caller must initialize and retain optimizer state."
-    )
-    _params_doc = "params (iterable): iterable of Tensors or dicts defining parameter groups"
-    _foreach_doc = "foreach (bool, optional): whether to use the foreach implementation (default: None, which defaults to foreach on CUDA)."
-    def _default_to_fused_or_foreach(params, differentiable=False, use_fused=False):  # type: ignore[no-redef]
-        foreach = any(p.is_cuda for p in params)
+    def _default_to_fused_or_foreach(params, differentiable=False, use_fused=False):  # type: ignore[misc,no-redef]
+        foreach = bool(params) and all(p.is_cuda for p in params)
         return False, foreach
-    def _to_scalar(x):  # type: ignore[no-redef]
+
+    def _to_scalar(x):  # type: ignore[misc,no-redef]
         return x.squeeze() if isinstance(x, Tensor) and x.dim() != 0 else x
 
-ParamsT: TypeAlias = Iterable[Tensor] | Iterable[dict[str, Any]]
 
-
+ParamsT: TypeAlias = (
+    Iterable[Tensor]
+    | Iterable[dict[str, Any]]
+    | Iterable[tuple[str, Tensor]]
+)
 
 __all__ = ["Echelon", "echelon"]
 
@@ -86,18 +93,22 @@ def _is_dtensor(t: Tensor) -> bool:
             from torch.distributed.tensor import DTensor as _DTensor_cls
 
             _DTensor = _DTensor_cls
-        except Exception:
+        except (ImportError, AttributeError, RuntimeError):
             _DTensor = None
     return _DTensor is not None and isinstance(t, _DTensor)
 
 
-# Relative diagonal shift of the shifted Cholesky-QR used by the batched (foreach) path.
+# Relative diagonal shift of the shifted Cholesky-QR used by the foreach path.
 _CHOLESKY_QR_SHIFT = 1e-6
-# The foreach path batches same-shape matrices up to this many elements; larger ones gain
-# little from batching and would pay for a stacked copy.
+# Maximum entrywise Gram error max|U^T U - I| accepted for a refreshed frame;
+# passes IEEE fp32 (~1e-6) and TF32 (~3e-4) orthonormal frames while rejecting
+# rank-deficient / collapsed Cholesky-QR outputs (error ~1.0).
+_ORTH_TOL = 1e-2
+# The foreach path stacks same-shape matrices up to this many elements; larger
+# ones gain little from stacking and are stepped individually (still using
+# Cholesky-QR2).
 _FOREACH_MAX_NUMEL = 2**22
 _FOREACH_MAX_BATCH_NUMEL = 2**26
-_EYES: dict[tuple[int, torch.dtype, torch.device], Tensor] = {}
 
 
 @contextmanager
@@ -135,23 +146,19 @@ def _householder_qr(Y: Tensor) -> Tensor:
 def _cholesky_qr2(Y: Tensor) -> Tensor:
     """Orthonormalize the columns of `Y` (`... x n x r`) with two shifted Cholesky-QR passes.
 
-    Unlike Householder QR, this is a few GEMMs plus batched `r x r` solves, so it stays cheap when
-    batched over many matrices. Directions missing from a rank-deficient `Y` come out near zero
-    rather than as an arbitrary orthonormal completion, and regrow once the momentum excites them.
-    A rank-deficient or very ill-conditioned `Y` can still leave the shifted Gram matrix indefinite
-    after float32 roundoff; such entries come out as NaN.
+    Unlike Householder QR, this is a few GEMMs plus `r x r` Cholesky/triangular solves,
+    making it substantially faster on GPU both when batched and on large single matrices.
+    A rank-deficient or severely ill-conditioned `Y` either fails Cholesky (`NaN`) or
+    leaves missing directions near zero (`U^T U != I`); `_echelon_step_impl` checks both
+    finiteness and `max|U^T U - I| <= _ORTH_TOL` and retains the previous orthonormal
+    frame when either fails.
     """
-    # The shift matrix is read-only, so cache it per (size, dtype, device).
-    _eye_key = (Y.size(-1), Y.dtype, Y.device)
-    eye = _EYES.get(_eye_key)
-    if eye is None:
-        eye = torch.eye(Y.size(-1), dtype=Y.dtype, device=Y.device)
-        _EYES[_eye_key] = eye
     for _ in range(2):
         G = Y.mT @ Y
-        mean_diag = G.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None]
-        shift = (_CHOLESKY_QR_SHIFT * mean_diag).clamp_min(_TINY) * eye
-        L, info = torch.linalg.cholesky_ex(G + shift)
+        G_diag = G.diagonal(dim1=-2, dim2=-1)
+        shift = (_CHOLESKY_QR_SHIFT * G_diag.mean(-1, keepdim=True)).clamp_min(_TINY)
+        G_diag.add_(shift)
+        L, info = torch.linalg.cholesky_ex(G)
         L = torch.where((info == 0)[..., None, None], L, torch.nan)
         Y = torch.linalg.solve_triangular(L, Y.mT, upper=False).mT
     return Y
@@ -167,6 +174,53 @@ def _frob_norm(X: Tensor) -> Tensor:
     return torch.linalg.vector_norm(X, dim=(-2, -1), keepdim=True)
 
 
+def _prepare_unit_momentum(
+    X: Tensor, eps: float, owns_input: bool
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Normalize ``X`` to unit Frobenius norm in ``float32`` without overflow, underflow, or NaN leakage.
+
+    Pre-scaling by the infinity norm keeps entries in ``[-1, 1]`` before squaring so
+    ``float32`` inputs near ``1e20``--``1e38`` do not overflow ``||X||_F`` to ``inf`` and
+    tiny ``float32`` inputs near ``1e-25``--``1e-42`` (or ``float64`` inputs outside
+    ``float32`` range) do not underflow to ``0``. Non-finite or zero matrices are
+    masked to exact ``0.0`` with ``active=False`` and ``scale=0.0``.
+    """
+    if X.dtype == torch.float64:
+        amax64 = torch.linalg.vector_norm(
+            X, ord=float("inf"), dim=(-2, -1), keepdim=True
+        )
+        active = torch.isfinite(amax64) & (amax64 > 0)
+        Xf64 = X.masked_fill(~active, 0.0)
+        Xf64.div_(torch.where(active, amax64, 1.0))
+        Xf = Xf64.to(dtype=torch.float32, memory_format=torch.preserve_format)
+        scaled_norm = _frob_norm(Xf)
+        if eps > 0.0:
+            ratio = torch.where(amax64 < eps, amax64 / eps, 1.0).to(dtype=torch.float32)
+            scale = torch.where(active, (ratio * scaled_norm).clamp_max(1.0), 0.0)
+        else:
+            scale = torch.where(active, 1.0, 0.0)
+        Xf.div_(scaled_norm.clamp_min(_TINY))
+        return Xf, scale, active
+
+    if X.dtype == torch.float32:
+        Xf = X if owns_input else X.clone(memory_format=torch.preserve_format)
+    else:
+        Xf = X.to(dtype=torch.float32, memory_format=torch.preserve_format)
+
+    amax = torch.linalg.vector_norm(Xf, ord=float("inf"), dim=(-2, -1), keepdim=True)
+    active = torch.isfinite(amax) & (amax > 0)
+    Xf.masked_fill_(~active, 0.0)
+    Xf.div_(torch.where(active, amax, 1.0))
+    scaled_norm = _frob_norm(Xf)
+    if eps > 0.0:
+        ratio = torch.where(amax < eps, amax / eps, 1.0)
+        scale = torch.where(active, (ratio * scaled_norm).clamp_max(1.0), 0.0)
+    else:
+        scale = torch.where(active, 1.0, 0.0)
+    Xf.div_(scaled_norm.clamp_min(_TINY))
+    return Xf, scale, active
+
+
 def _echelon_step(
     X: Tensor,
     U: Tensor | None,
@@ -180,19 +234,29 @@ def _echelon_step(
     eps: float,
     orth: Callable[[Tensor], Tensor] = _householder_qr,
     autocast_disabled: bool = False,
+    _owns_input: bool = False,
 ) -> Tensor:
     """Compute Echelon updates for short-side-first momenta `X` (`... x s x l`, `s <= l`), updating `U` and `z` in place.
 
     ``autocast_disabled`` is an internal escape hatch for callers (the warmup
     in :meth:`Echelon._init_group`) that already entered the disabled-autocast
     context, so the context is entered once per step rather than once per
-    parameter."""
+    parameter. ``_owns_input`` indicates that ``X`` is an unaliased temporary
+    that may be mutated in place when already ``float32``."""
     ctx = nullcontext() if autocast_disabled else _disable_autocast(X.device.type)
     with ctx:
         return _echelon_step_impl(
-            X, U, z, rank=rank, ns_coefficients=ns_coefficients,
-            ns_steps=ns_steps, tau_iters=tau_iters, margin=margin, eps=eps,
+            X,
+            U,
+            z,
+            rank=rank,
+            ns_coefficients=ns_coefficients,
+            ns_steps=ns_steps,
+            tau_iters=tau_iters,
+            margin=margin,
+            eps=eps,
             orth=orth,
+            owns_input=_owns_input,
         )
 
 
@@ -208,56 +272,62 @@ def _echelon_step_impl(
     margin: float,
     eps: float,
     orth: Callable[[Tensor], Tensor],
+    owns_input: bool = False,
 ) -> Tensor:
-    Xf = X.to(dtype=torch.float32)
-    s = Xf.size(-2)
-    x_norm = _frob_norm(Xf)
-    denom = x_norm.clamp_min(eps) if eps > 0.0 else x_norm
+    s = X.size(-2)
+    T, scale, active = _prepare_unit_momentum(X, eps, owns_input)
     if rank >= s:
-        return _quintic_newton_schulz(
-            Xf / denom.clamp_min(_TINY), ns_coefficients, ns_steps
-        )
+        T.mul_(scale)
+        out = _quintic_newton_schulz(T, ns_coefficients, ns_steps)
+        out.masked_fill_(~active, 0.0)
+        return out
 
     if U is None or z is None:
         raise ValueError(
             f"subspace_frame and tail_vec must be provided when rank ({rank}) < short_side ({s})"
         )
 
-    active = torch.isfinite(x_norm) & (x_norm > 0)
-    scale = torch.where(active, x_norm / denom.clamp_min(_TINY), 0.0)
-    X_unit = Xf / x_norm.clamp_min(_TINY)
     Uf = U.to(dtype=torch.float32)
 
-    # 1. Refresh tracked top-r subspace: V = orth(X^T U), U = orth(X V), keeping U if orth failed
-    U_next = _subspace_step(X_unit, Uf, orth)
-    refresh = active & torch.isfinite(U_next).all(dim=(-2, -1), keepdim=True)
+    # 1. Refresh tracked top-r subspace: V = orth(X^T U), U = orth(X V),
+    # keeping U if orth produced non-finite entries or lost orthonormality.
+    U_next = _subspace_step(T, Uf, orth)
+    gram_err = U_next.mT @ U_next
+    gram_err.diagonal(dim1=-2, dim2=-1).sub_(1.0)
+    orth_ok = gram_err.abs().amax(dim=(-2, -1), keepdim=True) <= _ORTH_TOL
+    refresh = active & torch.isfinite(U_next).all(dim=(-2, -1), keepdim=True) & orth_ok
     Uf = torch.where(refresh, U_next, Uf)
 
     # 2. Head: H = U^T X, P = NS5(H)
-    H = Uf.mT @ X_unit
+    H = Uf.mT @ T
     H_norm = _frob_norm(H)
     P = _quintic_newton_schulz(
         (H / H_norm.clamp_min(_TINY)) * scale, ns_coefficients, ns_steps
     )
 
     # 3. Tail: T = X - U H (re-projected once to keep U^T T = 0 to fp32 precision).
-    # Reuse T in place: X_unit is not read again, and the second projection
-    # and the output below fuse into T instead of allocating new s x l tensors.
-    T = X_unit - Uf @ H
-    T -= Uf @ (Uf.mT @ T)
+    # Fuse both projections directly into T via addmm_/baddbmm_ to avoid allocating
+    # s x l temporaries and preserve X's memory layout on transposed views.
+    if T.ndim == 2:
+        T.addmm_(Uf, H, beta=1.0, alpha=-1.0)
+        T.addmm_(Uf, Uf.mT @ T, beta=1.0, alpha=-1.0)
+    else:
+        T.baddbmm_(Uf, H, beta=1.0, alpha=-1.0)
+        T.baddbmm_(Uf, Uf.mT @ T, beta=1.0, alpha=-1.0)
     t_frob = _frob_norm(T)
     tau_floor = _TAU_FLOOR_MULT * math.sqrt(s) * _FP32_EPS * H_norm
 
     zf = z.to(dtype=torch.float32)
     z_cur = zf / _frob_norm(zf).clamp_min(_TINY)
-    # Fallback if tau_iters is 0 (not reachable via the validated paths,
-    # which require tau_iters >= 1); the loop below overwrites it otherwise.
     est = t_frob
     for _ in range(tau_iters):
         w = T @ z_cur
-        est = _frob_norm(w)
+        w_norm = _frob_norm(w)
         z_next = T.mT @ w
         z_next_norm = _frob_norm(z_next)
+        # ||T^T w|| / ||w|| = ||T^T (w / ||w||)|| <= sigma_max(T) gives an extra
+        # half power step of accuracy over ||w|| with no additional matmul.
+        est = torch.where(w_norm > 0, z_next_norm / w_norm.clamp_min(_TINY), 0.0)
         z_cur = torch.where(
             z_next_norm > 0, z_next / z_next_norm.clamp_min(_TINY), z_cur
         )
@@ -274,7 +344,29 @@ def _echelon_step_impl(
         T.addmm_(Uf, P)
     else:
         T.baddbmm_(Uf, P)
+    T.masked_fill_(~active, 0.0)
     return T
+
+
+def _is_real_number(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _validate_echelon_scalar_hyperparameters(
+    *,
+    momentum: float,
+    weight_decay: float,
+    adjust_lr_fn: str | None,
+) -> None:
+    if not _is_real_number(momentum) or not (0.0 <= momentum < 1.0):
+        raise ValueError(f"momentum must be a finite number in [0, 1), got: {momentum!r}")
+    if (
+        not _is_real_number(weight_decay)
+        or not math.isfinite(weight_decay)
+        or weight_decay < 0.0
+    ):
+        raise ValueError(f"weight decay should be finite and >= 0, got: {weight_decay!r}")
+    _validate_adjust_lr_fn(adjust_lr_fn)
 
 
 def _validate_echelon_hyperparameters(
@@ -284,15 +376,18 @@ def _validate_echelon_hyperparameters(
     weight_decay: float,
     adjust_lr_fn: str | None,
 ) -> None:
-    if isinstance(lr, Tensor) and lr.numel() != 1:
-        raise ValueError("Tensor lr must be 1-element")
-    if not 0.0 <= lr:
-        raise ValueError(f"Learning rate should be >= 0 but is: {lr}")
-    if not 0.0 <= momentum:
-        raise ValueError(f"momentum should be >= 0 but is: {momentum}")
-    if not 0.0 <= weight_decay:
-        raise ValueError(f"weight decay should be >= 0 but is: {weight_decay}")
-    _validate_adjust_lr_fn(adjust_lr_fn)
+    if isinstance(lr, Tensor):
+        if torch.is_complex(lr) or lr.dtype == torch.bool or lr.numel() != 1:
+            raise ValueError("Tensor lr must be a real 1-element tensor")
+        if not bool(torch.isfinite(lr) & (lr >= 0.0)):
+            raise ValueError(f"Learning rate should be finite and >= 0 but is: {lr}")
+    elif not _is_real_number(lr) or not math.isfinite(lr) or lr < 0.0:
+        raise ValueError(f"Learning rate should be finite and >= 0 but is: {lr!r}")
+    _validate_echelon_scalar_hyperparameters(
+        momentum=momentum,
+        weight_decay=weight_decay,
+        adjust_lr_fn=adjust_lr_fn,
+    )
 
 
 def _validate_echelon_options(
@@ -303,13 +398,13 @@ def _validate_echelon_options(
     ns_steps: int,
     ns_coefficients: tuple[float, float, float],
     eps: float,
-) -> None:
+) -> tuple[float, float, float]:
     if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
         raise ValueError(f"rank must be an integer >= 1, got: {rank!r}")
     if isinstance(tau_iters, bool) or not isinstance(tau_iters, int) or tau_iters < 1:
         raise ValueError(f"tau_iters must be an integer >= 1, got: {tau_iters!r}")
-    if not margin > 0.0:
-        raise ValueError(f"margin must be > 0, got: {margin}")
+    if not _is_real_number(margin) or not math.isfinite(margin) or margin <= 0.0:
+        raise ValueError(f"margin must be finite and > 0, got: {margin!r}")
     if (
         isinstance(ns_steps, bool)
         or not isinstance(ns_steps, int)
@@ -318,20 +413,27 @@ def _validate_echelon_options(
         raise ValueError(
             f"ns_steps must be an integer in [1, 100) for computational efficiency, got: {ns_steps!r}"
         )
-    try:
-        _coeffs = [float(c) for c in ns_coefficients]  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        raise ValueError(
+    if not isinstance(ns_coefficients, Iterable) or isinstance(
+        ns_coefficients, (str, bytes)
+    ):
+        msg = (
             "Coefficients must be a tuple of exactly 3 finite numbers, "
             f"got: {ns_coefficients!r}"
-        ) from None
-    if len(_coeffs) != 3 or not all(math.isfinite(c) for c in _coeffs):
+        )
+        raise ValueError(msg)  # noqa: TRY004
+    raw_coeffs = list(ns_coefficients)
+    if (
+        len(raw_coeffs) != 3
+        or not all(_is_real_number(c) and math.isfinite(float(c)) for c in raw_coeffs)
+    ):
         raise ValueError(
             "Coefficients must be a tuple of exactly 3 finite numbers, "
             f"got: {ns_coefficients!r}"
         )
-    if not 0.0 <= eps:
-        raise ValueError(f"eps should be >= 0 but is: {eps}")
+    coeffs = (float(raw_coeffs[0]), float(raw_coeffs[1]), float(raw_coeffs[2]))
+    if not _is_real_number(eps) or not math.isfinite(eps) or eps < 0.0:
+        raise ValueError(f"eps should be finite and >= 0 but is: {eps!r}")
+    return coeffs
 
 
 def _validate_foreach(foreach: bool | None) -> None:
@@ -356,17 +458,21 @@ def _warmup_frame(
     The active check is a host sync, but only on frame creation or while a
     warmup is pending -- never in the steady state.
     """
-    m0 = state["momentum_buffer"].lerp(p.grad, 1 - group["momentum"])
+    grad = cast(Tensor, p.grad)
+    m0 = state["momentum_buffer"].lerp(grad, 1 - group["momentum"])
     if group["nesterov"]:
-        m0 = p.grad.lerp(m0, group["momentum"])
-    X0 = m0.T if p.size(0) > p.size(1) else m0
-    x0_norm = torch.linalg.vector_norm(X0.to(dtype=torch.float32))
-    active = bool(torch.isfinite(x0_norm) & (x0_norm > 0))
+        m0 = grad.lerp(m0, group["momentum"])
+    X0 = m0.mT if p.size(0) > p.size(1) else m0
+    amax0 = torch.linalg.vector_norm(X0, ord=float("inf"))
+    active = bool(torch.isfinite(amax0) & (amax0 > 0))
     if active:
         with _disable_autocast(p.device.type):
             for _ in range(_WARMUP_STEPS):
                 _echelon_step(
-                    X0, U, z, rank=rank,
+                    X0,
+                    U,
+                    z,
+                    rank=rank,
                     ns_coefficients=group["ns_coefficients"],
                     ns_steps=group["ns_steps"],
                     tau_iters=group["tau_iters"],
@@ -380,12 +486,17 @@ def _warmup_frame(
 def _check_group_inputs(group: MutableMapping) -> None:
     """Reject DTensor/complex/sparse/non-2D inputs before any group is stepped.
 
-    ``Echelon.step`` calls this for every group up front: the per-group
-    checks in ``_init_group`` run after earlier groups have already been
-    stepped, so a bad input in a later group would otherwise leave the
-    earlier groups stepped for one gradient (the same partial-step failure
-    the up-front option validation exists to prevent).
+    ``Echelon.step`` calls this for every group up front (and again after a
+    closure runs): the per-group loop would otherwise leave earlier groups
+    stepped if a later group fails validation.
     """
+    lr = group["lr"]
+    if isinstance(lr, Tensor):
+        if torch.is_complex(lr) or lr.dtype == torch.bool or lr.numel() != 1:
+            raise ValueError("Tensor lr must be a real 1-element tensor")
+    elif not _is_real_number(lr) or not math.isfinite(lr) or lr < 0.0:
+        raise ValueError(f"Learning rate should be finite and >= 0 but is: {lr!r}")
+
     for p in group["params"]:
         if _is_dtensor(p):
             raise NotImplementedError(
@@ -398,15 +509,32 @@ def _check_group_inputs(group: MutableMapping) -> None:
             )
         if torch.is_complex(p):
             raise RuntimeError("Echelon does not support complex parameters")
-        if p.grad is not None and p.grad.is_sparse:
-            raise RuntimeError("Echelon does not support sparse gradients")
+        g = p.grad
+        if g is not None:
+            if _is_dtensor(g):
+                raise NotImplementedError(
+                    "Echelon does not support DTensor gradients "
+                    "(for example under FSDP2)"
+                )
+            if torch.is_complex(g):
+                raise RuntimeError("Echelon does not support complex gradients")
+            if g.is_sparse:
+                raise RuntimeError("Echelon does not support sparse gradients")
+            if g.shape != p.shape:
+                raise ValueError(
+                    f"Gradient shape {tuple(g.shape)} does not match parameter shape {tuple(p.shape)}"
+                )
+            if g.device != p.device:
+                raise ValueError(
+                    f"Gradient device {g.device} does not match parameter device {p.device}"
+                )
 
 
 class Echelon(Optimizer):
     def __init__(
         self,
         params: ParamsT,
-        lr: float = 1e-3,
+        lr: float | Tensor = 1e-3,
         weight_decay: float = 0.1,
         momentum: float = 0.95,
         nesterov: bool = True,
@@ -426,7 +554,7 @@ class Echelon(Optimizer):
             weight_decay=weight_decay,
             adjust_lr_fn=adjust_lr_fn,
         )
-        _validate_echelon_options(
+        ns_coefficients = _validate_echelon_options(
             rank=rank,
             tau_iters=tau_iters,
             margin=margin,
@@ -473,7 +601,7 @@ class Echelon(Optimizer):
                 weight_decay=group["weight_decay"],
                 adjust_lr_fn=group["adjust_lr_fn"],
             )
-            _validate_echelon_options(
+            group["ns_coefficients"] = _validate_echelon_options(
                 rank=group["rank"],
                 tau_iters=group["tau_iters"],
                 margin=group["margin"],
@@ -494,9 +622,40 @@ class Echelon(Optimizer):
                         "Pass only 2D hidden weights to Echelon (see echelon.partition_parameters) "
                         "and use another optimizer, e.g. AdamW, for the rest."
                     )
+                if torch.is_complex(p):
+                    raise RuntimeError("Echelon does not support complex parameters")
         except Exception:
             self.param_groups.pop()
             raise
+
+    @torch._disable_dynamo
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        r"""Load optimizer state, preserving ``float32`` precision for ``subspace_frame`` and ``tail_vec``.
+
+        :meth:`torch.optim.Optimizer.load_state_dict` casts floating-point state
+        tensors to the parameter's dtype (e.g. ``bfloat16``), which would round
+        orthonormal subspace frames on checkpoint load. When the incoming state
+        dict stores ``subspace_frame`` or ``tail_vec`` in ``torch.float32``,
+        this override restores them in ``torch.float32`` on the parameter's
+        device without rounding.
+        """
+        super().load_state_dict(state_dict)
+        saved_state_map = state_dict.get("state", {})
+        saved_groups = state_dict.get("param_groups", [])
+        for saved_group, group in zip(saved_groups, self.param_groups):
+            for saved_id, p in zip(saved_group.get("params", []), group["params"]):
+                saved_p_state = saved_state_map.get(saved_id)
+                if saved_p_state is None or p not in self.state:
+                    continue
+                p_state = self.state[p]
+                for key in ("subspace_frame", "tail_vec"):
+                    orig = saved_p_state.get(key)
+                    if isinstance(orig, Tensor) and orig.dtype == torch.float32:
+                        p_state[key] = (
+                            orig.to(device=p.device, dtype=torch.float32)
+                            .contiguous()
+                            .clone()
+                        )
 
     def _init_group(
         self,
@@ -510,11 +669,6 @@ class Echelon(Optimizer):
     ) -> bool:
         rank = group["rank"]
         for param_idx, p in enumerate(group["params"]):
-            if _is_dtensor(p):
-                raise NotImplementedError(
-                    "Echelon does not support DTensor parameters "
-                    "(for example under FSDP2)"
-                )
             s, l = min(p.size(0), p.size(1)), max(p.size(0), p.size(1))
             low_rank = p.numel() > 0 and rank < s
             if not low_rank and p in self.state:
@@ -524,10 +678,6 @@ class Echelon(Optimizer):
                 self.state[p].pop("warmed", None)
             if p.grad is None:
                 continue
-            if torch.is_complex(p):
-                raise RuntimeError("Echelon does not support complex parameters")
-            if p.grad.is_sparse:
-                raise RuntimeError("Echelon does not support sparse gradients")
 
             params_with_grad.append(p)
             grads.append(p.grad)
@@ -546,9 +696,12 @@ class Echelon(Optimizer):
                     # A CPU generator gives the same initial frame on every device.
                     gen = torch.Generator(device="cpu")
                     gen.manual_seed(group_idx * 1000003 + param_idx)
-                    f32_cpu = {"device": "cpu", "dtype": torch.float32}
-                    u0 = torch.randn((s, rank), generator=gen, **f32_cpu)
-                    z0 = torch.randn((l, 1), generator=gen, **f32_cpu)
+                    u0 = torch.randn(
+                        (s, rank), generator=gen, device="cpu", dtype=torch.float32
+                    )
+                    z0 = torch.randn(
+                        (l, 1), generator=gen, device="cpu", dtype=torch.float32
+                    )
                     with _disable_autocast(p.device.type):
                         U0, _ = torch.linalg.qr(u0.to(device=p.device), mode="reduced")
                     # linalg.qr returns a column-major Q. Store the frame row-major: later steps
@@ -563,8 +716,8 @@ class Echelon(Optimizer):
                     state["warmed"] = _warmup_frame(group, p, state, U0, z0, rank=rank)
                 else:
                     if frame.dtype != torch.float32:
-                        # load_state_dict casts state to the parameter dtype by default.
-                        state["subspace_frame"] = frame.to(torch.float32)
+                        # Fallback if a caller loaded a pre-cast state dict directly.
+                        state["subspace_frame"] = frame.to(torch.float32).contiguous()
                         state["tail_vec"] = state["tail_vec"].to(torch.float32)
                     if not state.get("warmed", True):
                         # First finite, nonzero update since the frame was
@@ -572,8 +725,12 @@ class Echelon(Optimizer):
                         # frame. Checkpoints saved before the flag existed
                         # (missing key) are treated as already warmed.
                         state["warmed"] = _warmup_frame(
-                            group, p, state,
-                            state["subspace_frame"], state["tail_vec"], rank=rank,
+                            group,
+                            p,
+                            state,
+                            state["subspace_frame"],
+                            state["tail_vec"],
+                            rank=rank,
                         )
                 subspace_frames.append(state["subspace_frame"])
                 tail_vecs.append(state["tail_vec"])
@@ -583,13 +740,9 @@ class Echelon(Optimizer):
 
         return False  # has_complex
 
-    @torch.no_grad()
-    def step(self, closure=None):
-        """Performs a single optimization step."""
-        # Validate every group before any state is touched: an invalid `rank` would otherwise
-        # replace the frames, or leave earlier groups stepped.
+    def _validate_all_groups(self) -> None:
         for group in self.param_groups:
-            _validate_echelon_options(
+            group["ns_coefficients"] = _validate_echelon_options(
                 rank=group["rank"],
                 tau_iters=group["tau_iters"],
                 margin=group["margin"],
@@ -597,17 +750,30 @@ class Echelon(Optimizer):
                 ns_coefficients=group["ns_coefficients"],
                 eps=group["eps"],
             )
-            # _validate_echelon_hyperparameters is deliberately not used here:
-            # its lr check on a CUDA tensor lr would add a host-device sync
-            # every step. adjust_lr_fn is a plain string, so checking it
-            # up front is sync-free.
-            _validate_adjust_lr_fn(group["adjust_lr_fn"])
+            # Tensor lr value checks are skipped here to avoid a CUDA host sync
+            # on every step; scalar hyperparameters and shapes/dtypes are sync-free.
+            _validate_echelon_scalar_hyperparameters(
+                momentum=group["momentum"],
+                weight_decay=group["weight_decay"],
+                adjust_lr_fn=group["adjust_lr_fn"],
+            )
             _validate_foreach(group["foreach"])
             _check_group_inputs(group)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Performs a single optimization step."""
+        # Validate every group before running a closure or touching state: an
+        # invalid option or input in a later group must never leave earlier
+        # groups partially stepped.
+        self._validate_all_groups()
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+            # Re-validate after the closure in case it created invalid (e.g.
+            # sparse) gradients or mutated group options.
+            self._validate_all_groups()
 
         for group_idx, group in enumerate(self.param_groups):
             params_with_grad: list[Tensor] = []
@@ -649,6 +815,7 @@ class Echelon(Optimizer):
                 foreach=group["foreach"],
                 has_complex=has_complex,
                 _prevalidated=True,
+                _skip_input_checks=True,
             )
         return loss
 
@@ -695,30 +862,30 @@ Echelon.__doc__ = (
     When :math:`r \ge \min(m, n)`, the tail vanishes and Echelon reduces directly to full-rank Newton-Schulz.
     :math:`\mathrm{AdjustLR}` is the learning-rate scaling selected by ``adjust_lr_fn``, as in
     :class:`torch.optim.Muon`, and :math:`\epsilon` (``eps``) floors the Frobenius norm that
-    normalizes :math:`X_t` before these steps.
+    normalizes :math:`X_t` before these steps (matching Muon's ``NS_k(X / max(||X||_F, eps))``
+    convention on the head and full-rank path while scaling the tail by ``min(1, ||X||_F / eps)``).
 
     .. note::
-        This reference implementation computes reduced QR, head Newton-Schulz, and explicit tail
-        deflation in ``torch.float32`` per parameter, with autocast disabled inside the step (rather
-        than the blog post's batched ``bfloat16`` Cholesky-QR / fused kernel). The roundoff floor
+        This implementation computes orthonormalization, head Newton-Schulz, and explicit tail
+        deflation in ``torch.float32``, with autocast disabled inside the step. The roundoff floor
         :math:`\epsilon_{\tau} = 16\sqrt{s}\,\epsilon_{\text{fp32}}\lVert H_t \rVert_F` keeps
         rank-deficient momenta from amplifying float32 cancellation noise, and the lower bound
-        :math:`\lVert T_t \rVert_F / \sqrt{s - r}` guards against an underestimated
-        :math:`\widehat{\sigma}_{\max}(T_t)`; if the power iteration returns zero,
-        :math:`\lVert T_t \rVert_F` replaces it. The floor assumes IEEE float32 matmuls. As for other
-        optimizers, matmul precision follows the caller's settings
-        (``torch.backends.cuda.matmul.fp32_precision``, ``torch.backends.mkldnn.matmul.fp32_precision``
-        and :func:`torch.set_float32_matmul_precision`); with TF32 or bfloat16 matmuls, the roundoff
-        tail of a rank-deficient momentum is amplified (update spectral norm up to about 1.5 instead
-        of 1.1). The first step warms up :math:`U` and :math:`z` on :math:`X_t`, discarding the
-        updates; a zero or non-finite first update leaves them at their random start and the
-        warmup pending, retried on the first finite, nonzero update (recorded in optimizer
-        state, so a checkpoint preserves it). Changing a group's ``rank`` re-initializes them
-        the same way at the next step, and parameters with ``rank >= s`` drop them. ``subspace_frame`` and ``tail_vec`` are kept in
-        ``torch.float32``: if :meth:`load_state_dict` casts them to a low-precision parameter dtype,
-        the next step converts them back (a state-dtype-preserving load avoids the
-        round trip). DTensor parameters, for example under FSDP2, are rejected with
-        ``NotImplementedError`` rather than failing inside the step.
+        :math:`\lVert T_t \rVert_F / \sqrt{s - r}` bounds worst-case tail amplification (to at most
+        :math:`\sqrt{s - r} / c_{\tau}` if the probe vector happens to be orthogonal to the dominant
+        tail direction); if the power iteration returns zero, :math:`\lVert T_t \rVert_F` replaces it.
+        The floor assumes IEEE float32 matmuls. As for other optimizers, matmul precision follows the
+        caller's settings (``torch.backends.cuda.matmul.fp32_precision``,
+        ``torch.backends.mkldnn.matmul.fp32_precision`` and :func:`torch.set_float32_matmul_precision`);
+        with TF32 or bfloat16 matmuls, the roundoff tail of a rank-deficient momentum is amplified
+        (update spectral norm up to about 1.5 instead of 1.1). The first step warms up :math:`U` and
+        :math:`z` on :math:`X_t`, discarding the updates; a zero or non-finite first update leaves
+        them at their random start and the warmup pending, retried on the first finite, nonzero update
+        (recorded in optimizer state, so a checkpoint preserves it). Changing a group's ``rank``
+        re-initializes them the same way at the next step, and parameters with ``rank >= s`` drop them.
+        ``subspace_frame`` and ``tail_vec`` are kept in ``torch.float32``, and :meth:`load_state_dict`
+        preserves their ``float32`` precision even on ``bfloat16``/``float16`` parameters. DTensor
+        parameters, for example under FSDP2, are rejected with ``NotImplementedError`` rather than
+        failing inside the step.
         Defaults (``lr=1e-3``, ``weight_decay=0.1``) mirror :class:`torch.optim.Muon`;
         the Echelon blog post uses ``lr=0.02``, ``weight_decay=0.0``, and ``rank = max(64, width // 16)``.
 
@@ -729,9 +896,10 @@ Echelon.__doc__ = (
         {_params_doc}. Echelon supports 2D matrix parameters and is intended for hidden-layer weights.
             Non-2D parameters (biases, norms), as well as 2D embeddings and output heads, should use
             a standard optimizer such as AdamW.
-        lr (float, Tensor, optional): learning rate (default: 1e-3).
+        lr (float, Tensor, optional): learning rate (default: 1e-3). Supports 0D/1-element CUDA
+            tensors without host synchronization or breaking CUDA graph capture.
         weight_decay (float, optional): decoupled weight decay penalty (default: 0.1).
-        momentum (float, optional): momentum factor (default: 0.95).
+        momentum (float, optional): momentum factor in ``[0, 1)`` (default: 0.95).
         nesterov (bool, optional): enables Nesterov momentum (default: True).
         rank (int, optional): tracked top singular subspace rank :math:`r`, a Python ``int`` >= 1
             (default: {DEFAULT_RANK}).
@@ -747,24 +915,17 @@ Echelon.__doc__ = (
             (default: {DEFAULT_NS_STEPS}).
         adjust_lr_fn (str, optional): learning-rate scaling rule. One of ``"original"``,
             ``"match_rms_adamw"``, or ``"spectral_unclamped"`` (default: None, equivalent to ``"original"``).
-        {_foreach_doc} The foreach implementation batches same-shape parameters of up to
-            :math:`2^{{22}}` elements and orthonormalizes them with shifted Cholesky-QR instead of
-            Householder QR; larger parameters are stepped one at a time. A parameter whose
-            Cholesky factorization fails (rank-deficient or very ill-conditioned momentum) keeps
-            its previous frame for that step.
+        {_foreach_doc} The foreach implementation orthonormalizes with shifted Cholesky-QR2 instead
+            of Householder QR and batches same-shape parameters of up to :math:`2^{{22}}` elements
+            (computing Nesterov updates per chunk to bound temporary memory); larger parameters are
+            stepped one at a time without stacking. A parameter whose Cholesky-QR2 output is
+            non-finite or non-orthonormal (rank-deficient or very ill-conditioned momentum) keeps
+            its previous orthonormal frame for that step.
 
     Example:
         >>> # xdoctest: +SKIP
-        >>> hidden_weights = [
-        ...     p for n, p in model.named_parameters()
-        ...     if p.ndim == 2 and "embed" not in n and "head" not in n
-        ... ]
-        >>> other_params = [
-        ...     p for n, p in model.named_parameters()
-        ...     if p.ndim != 2 or "embed" in n or "head" in n
-        ... ]
-        >>> optim_echelon = Echelon(hidden_weights, lr=0.02, weight_decay=0.0, rank=64)
-        >>> optim_adamw = torch.optim.AdamW(other_params, lr=3e-4, weight_decay=0.01)
+        >>> from echelon import echelon_adamw_pair
+        >>> optim_echelon, optim_adamw = echelon_adamw_pair(model)
 
     .. _The Echelon Optimizer:
         https://evolvingmachines.ai/blog/echelon
@@ -787,7 +948,7 @@ def _check_echelon_inputs(
     eps: float,
     has_complex: bool,
     validate_options: bool = True,
-) -> None:
+) -> tuple[float, float, float]:
     if has_complex:
         raise RuntimeError("Echelon does not support complex parameters")
     if not (
@@ -801,7 +962,7 @@ def _check_echelon_inputs(
             "params, grads, momentum_bufs, subspace_frames, and tail_vecs must have matching lengths"
         )
     if validate_options:
-        _validate_echelon_options(
+        ns_coefficients = _validate_echelon_options(
             rank=rank,
             tau_iters=tau_iters,
             margin=margin,
@@ -817,10 +978,20 @@ def _check_echelon_inputs(
             )
         if torch.is_complex(param) or torch.is_complex(grad) or torch.is_complex(buf):
             raise RuntimeError("Echelon does not support complex parameters")
-        if grad.is_sparse:
+        if grad.is_sparse or buf.is_sparse:
             raise RuntimeError("Echelon does not support sparse gradients")
-        if param.ndim != 2 or grad.ndim != 2:
-            raise ValueError("Param and gradient must be 2D matrices")
+        if param.ndim != 2 or grad.ndim != 2 or buf.ndim != 2:
+            raise ValueError("Param, gradient, and momentum_buffer must be 2D matrices")
+        if grad.shape != param.shape or buf.shape != param.shape:
+            raise ValueError(
+                f"Expected grad and momentum_buffer shape {tuple(param.shape)} at index {i}, "
+                f"got {tuple(grad.shape)} and {tuple(buf.shape)}"
+            )
+        if grad.device != param.device or buf.device != param.device:
+            raise ValueError(
+                f"Param, grad, and momentum_buffer at index {i} must be on the same device, "
+                f"got {param.device}, {grad.device}, and {buf.device}"
+            )
         s, l = min(param.size(0), param.size(1)), max(param.size(0), param.size(1))
         if param.numel() > 0 and rank < s:
             u_i, z_i = subspace_frames[i], tail_vecs[i]
@@ -835,6 +1006,12 @@ def _check_echelon_inputs(
                     f"Expected subspace_frames[{i}] shape {(s, rank)} and tail_vecs[{i}] shape {(l, 1)}, "
                     f"got {tuple(u_i.shape)} and {tuple(z_i.shape)}"
                 )
+            if u_i.device != param.device or z_i.device != param.device:
+                raise ValueError(
+                    f"subspace_frames[{i}] and tail_vecs[{i}] must be on {param.device}, "
+                    f"got {u_i.device} and {z_i.device}"
+                )
+    return ns_coefficients
 
 
 def _single_tensor_echelon(
@@ -844,7 +1021,7 @@ def _single_tensor_echelon(
     subspace_frames: list[Tensor | None],
     tail_vecs: list[Tensor | None],
     *,
-    lr: float,
+    lr: float | Tensor,
     weight_decay: float,
     momentum: float,
     nesterov: bool,
@@ -857,24 +1034,43 @@ def _single_tensor_echelon(
     adjust_lr_fn: str | None,
     has_complex: bool,
     _prevalidated: bool = False,
+    _skip_input_checks: bool = False,
 ) -> None:
-    _check_echelon_inputs(
-        params,
-        grads,
-        momentum_bufs,
-        subspace_frames,
-        tail_vecs,
-        rank=rank,
-        tau_iters=tau_iters,
-        margin=margin,
-        ns_coefficients=ns_coefficients,
-        ns_steps=ns_steps,
-        eps=eps,
-        has_complex=has_complex,
-        validate_options=not _prevalidated,
-    )
+    if not _skip_input_checks:
+        ns_coefficients = _check_echelon_inputs(
+            params,
+            grads,
+            momentum_bufs,
+            subspace_frames,
+            tail_vecs,
+            rank=rank,
+            tau_iters=tau_iters,
+            margin=margin,
+            ns_coefficients=ns_coefficients,
+            ns_steps=ns_steps,
+            eps=eps,
+            has_complex=has_complex,
+            validate_options=not _prevalidated,
+        )
+    if len(params) == 0:
+        return
 
     lr_val = _to_scalar(lr)
+    is_tensor_lr = isinstance(lr_val, Tensor)
+    lr_by_dev: dict[torch.device, Tensor] = {}
+
+    def _lr_on(dev: torch.device) -> Tensor:
+        cached = lr_by_dev.get(dev)
+        if cached is None:
+            t = cast(Tensor, lr_val)
+            cached = (
+                t.to(dtype=torch.float32)
+                if t.device == dev
+                else t.to(device=dev, dtype=torch.float32)
+            )
+            lr_by_dev[dev] = cached
+        return cached
+
     for i, param in enumerate(params):
         grad = grads[i]
         buf = momentum_bufs[i]
@@ -884,7 +1080,7 @@ def _single_tensor_echelon(
         update = grad.lerp(buf, momentum) if nesterov else buf
 
         transposed = update.size(0) > update.size(1)
-        X = update.T if transposed else update
+        X = update.mT if transposed else update
         O = _echelon_step(
             X,
             subspace_frames[i],
@@ -895,13 +1091,23 @@ def _single_tensor_echelon(
             tau_iters=tau_iters,
             margin=margin,
             eps=eps,
+            _owns_input=nesterov,
         )
         if transposed:
-            O = O.T
+            O = O.mT
 
-        adjusted_lr = _adjust_lr(lr_val, adjust_lr_fn, param.shape)
-        param.mul_(1 - lr_val * weight_decay)
-        param.add_(O, alpha=-adjusted_lr)
+        if is_tensor_lr:
+            lr_dev = _lr_on(param.device)
+            if weight_decay != 0.0:
+                param.mul_(1.0 - lr_dev * weight_decay)
+            O.mul_(-_adjust_lr(lr_dev, adjust_lr_fn, param.shape))
+            param.add_(O)
+        else:
+            lr_f = cast(float, lr_val)
+            if weight_decay != 0.0:
+                param.mul_(1.0 - lr_f * weight_decay)
+            adjusted_lr = cast(float, _adjust_lr(lr_f, adjust_lr_fn, param.shape))
+            param.add_(O, alpha=-adjusted_lr)
 
 
 def _multi_tensor_echelon(
@@ -911,7 +1117,7 @@ def _multi_tensor_echelon(
     subspace_frames: list[Tensor | None],
     tail_vecs: list[Tensor | None],
     *,
-    lr: float,
+    lr: float | Tensor,
     weight_decay: float,
     momentum: float,
     nesterov: bool,
@@ -924,26 +1130,43 @@ def _multi_tensor_echelon(
     adjust_lr_fn: str | None,
     has_complex: bool,
     _prevalidated: bool = False,
+    _skip_input_checks: bool = False,
 ) -> None:
+    if not _skip_input_checks:
+        ns_coefficients = _check_echelon_inputs(
+            params,
+            grads,
+            momentum_bufs,
+            subspace_frames,
+            tail_vecs,
+            rank=rank,
+            tau_iters=tau_iters,
+            margin=margin,
+            ns_coefficients=ns_coefficients,
+            ns_steps=ns_steps,
+            eps=eps,
+            has_complex=has_complex,
+            validate_options=not _prevalidated,
+        )
     if len(params) == 0:
         return
-    _check_echelon_inputs(
-        params,
-        grads,
-        momentum_bufs,
-        subspace_frames,
-        tail_vecs,
-        rank=rank,
-        tau_iters=tau_iters,
-        margin=margin,
-        ns_coefficients=ns_coefficients,
-        ns_steps=ns_steps,
-        eps=eps,
-        has_complex=has_complex,
-        validate_options=not _prevalidated,
-    )
 
     lr_val = _to_scalar(lr)
+    is_tensor_lr = isinstance(lr_val, Tensor)
+    lr_by_dev: dict[torch.device, Tensor] = {}
+
+    def _lr_on(dev: torch.device) -> Tensor:
+        cached = lr_by_dev.get(dev)
+        if cached is None:
+            t = cast(Tensor, lr_val)
+            cached = (
+                t.to(dtype=torch.float32)
+                if t.device == dev
+                else t.to(device=dev, dtype=torch.float32)
+            )
+            lr_by_dev[dev] = cached
+        return cached
+
     step_kwargs = {
         "rank": rank,
         "ns_coefficients": ns_coefficients,
@@ -953,61 +1176,109 @@ def _multi_tensor_echelon(
         "eps": eps,
     }
     grouped_tensors = Optimizer._group_tensors_by_device_and_dtype(
-        [params, grads, momentum_bufs], with_indices=True
+        [
+            cast(list[Tensor | None], params),
+            cast(list[Tensor | None], grads),
+            cast(list[Tensor | None], momentum_bufs),
+        ],
+        with_indices=True,
     )
-    for (device_params, device_grads, device_bufs), indices in grouped_tensors.values():
+    for (dev_params_opt, dev_grads_opt, dev_bufs_opt), indices in grouped_tensors.values():
+        device_params = cast(list[Tensor], dev_params_opt)
+        device_grads = cast(list[Tensor], dev_grads_opt)
+        device_bufs = cast(list[Tensor], dev_bufs_opt)
         torch._foreach_lerp_(device_bufs, device_grads, 1 - momentum)
-        updates = (
-            torch._foreach_lerp(device_grads, device_bufs, momentum)
-            if nesterov
-            else device_bufs
-        )
-        torch._foreach_mul_(device_params, 1 - lr_val * weight_decay)
 
         # Under torch.compile, _group_tensors_by_device_and_dtype returns a single group, so
-        # batches are keyed by device and dtype as well.
+        # batches (and per-device tensor lr decay) are keyed by device as well.
+        if weight_decay != 0.0:
+            if is_tensor_lr:
+                by_dev: dict[torch.device, list[Tensor]] = defaultdict(list)
+                for p in device_params:
+                    if p.numel() > 0:
+                        by_dev[p.device].append(p)
+                for dev, dev_ps in by_dev.items():
+                    torch._foreach_mul_(dev_ps, 1.0 - _lr_on(dev) * weight_decay)
+            else:
+                torch._foreach_mul_(
+                    device_params, 1.0 - cast(float, lr_val) * weight_decay
+                )
+
         batches: dict[tuple[torch.device, torch.dtype, torch.Size], list[int]]
         batches = defaultdict(list)
         for j, p in enumerate(device_params):
             if p.numel() > 0:
                 batches[(p.device, p.dtype, p.shape)].append(j)
-        for (_, _, shape), js in batches.items():
+
+        for (dev, _, shape), js in batches.items():
             transposed = shape[0] > shape[1]
-            adjusted_lr = _adjust_lr(lr_val, adjust_lr_fn, shape)
+            lr_eff: float | Tensor = _lr_on(dev) if is_tensor_lr else cast(float, lr_val)
+            adjusted_lr = _adjust_lr(lr_eff, adjust_lr_fn, shape)
             frames = [subspace_frames[indices[j]] for j in js]
             tails = [tail_vecs[indices[j]] for j in js]
-            Xs = [updates[j].mT if transposed else updates[j] for j in js]
             if len(js) == 1 or shape.numel() > _FOREACH_MAX_NUMEL:
-                for j, X, U, z in zip(js, Xs, frames, tails):
-                    O = _echelon_step(X, U, z, **step_kwargs)
+                for j, U, z in zip(js, frames, tails):
+                    upd = (
+                        device_grads[j].lerp(device_bufs[j], momentum)
+                        if nesterov
+                        else device_bufs[j]
+                    )
+                    X = upd.mT if transposed else upd
+                    O = _echelon_step(
+                        X,
+                        U,
+                        z,
+                        orth=_cholesky_qr2,
+                        _owns_input=nesterov,
+                        **step_kwargs,
+                    )
+                    O_out = O.mT if transposed else O
                     p = device_params[j]
-                    p.add_(O.mT if transposed else O, alpha=-adjusted_lr)
+                    if is_tensor_lr:
+                        O_out.mul_(-adjusted_lr)
+                        p.add_(O_out)
+                    else:
+                        p.add_(O_out, alpha=-cast(float, adjusted_lr))
                 continue
 
             low_rank = rank < min(shape)
             chunk = max(1, _FOREACH_MAX_BATCH_NUMEL // shape.numel())
             for c in range(0, len(js), chunk):
+                chunk_js = js[c : c + chunk]
                 chunk_frames = cast(list[Tensor], frames[c : c + chunk])
                 chunk_tails = cast(list[Tensor], tails[c : c + chunk])
+                if nesterov:
+                    upd_stack = torch.stack([device_grads[j] for j in chunk_js])
+                    upd_stack.lerp_(
+                        torch.stack([device_bufs[j] for j in chunk_js]), momentum
+                    )
+                else:
+                    upd_stack = torch.stack([device_bufs[j] for j in chunk_js])
+                X_batch = upd_stack.mT if transposed else upd_stack
                 U = torch.stack(chunk_frames) if low_rank else None
                 z = torch.stack(chunk_tails) if low_rank else None
                 O = _echelon_step(
-                    torch.stack(Xs[c : c + chunk]),
+                    X_batch,
                     U,
                     z,
                     orth=_cholesky_qr2,
+                    _owns_input=True,
                     **step_kwargs,
                 )
                 if U is not None and z is not None:
                     torch._foreach_copy_(chunk_frames, list(U.unbind(0)))
                     torch._foreach_copy_(chunk_tails, list(z.unbind(0)))
-                chunk_params = [device_params[j] for j in js[c : c + chunk]]
-                torch._foreach_add_(
-                    chunk_params,
-                    [o.mT if transposed else o
-                     for o, _p in zip(O.unbind(0), chunk_params)],
-                    alpha=-adjusted_lr,
-                )
+                O_batch = O.mT if transposed else O
+                chunk_params = [device_params[j] for j in chunk_js]
+                if is_tensor_lr:
+                    O_batch.mul_(-adjusted_lr)
+                    torch._foreach_add_(chunk_params, list(O_batch.unbind(0)))
+                else:
+                    torch._foreach_add_(
+                        chunk_params,
+                        list(O_batch.unbind(0)),
+                        alpha=-cast(float, adjusted_lr),
+                    )
 
 
 @_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_echelon)
@@ -1019,7 +1290,7 @@ def echelon(
     tail_vecs: list[Tensor | None],
     *,
     foreach: bool | None = None,
-    lr: float,
+    lr: float | Tensor,
     weight_decay: float,
     momentum: float,
     nesterov: bool,
@@ -1032,11 +1303,16 @@ def echelon(
     adjust_lr_fn: str | None,
     has_complex: bool,
     _prevalidated: bool = False,
+    _skip_input_checks: bool = False,
 ) -> None:
     if not _prevalidated:
-        _validate_adjust_lr_fn(adjust_lr_fn)
+        _validate_echelon_scalar_hyperparameters(
+            momentum=momentum,
+            weight_decay=weight_decay,
+            adjust_lr_fn=adjust_lr_fn,
+        )
         _validate_foreach(foreach)
-        _validate_echelon_options(
+        ns_coefficients = _validate_echelon_options(
             rank=rank,
             tau_iters=tau_iters,
             margin=margin,
@@ -1044,6 +1320,11 @@ def echelon(
             ns_coefficients=ns_coefficients,
             eps=eps,
         )
+        if isinstance(lr, Tensor):
+            if torch.is_complex(lr) or lr.dtype == torch.bool or lr.numel() != 1:
+                raise ValueError("Tensor lr must be a real 1-element tensor")
+        elif not _is_real_number(lr) or not math.isfinite(lr) or lr < 0.0:
+            raise ValueError(f"Learning rate should be finite and >= 0 but is: {lr!r}")
     if foreach is None:
         _, foreach = _default_to_fused_or_foreach(
             params, differentiable=False, use_fused=False
@@ -1075,6 +1356,7 @@ def echelon(
         adjust_lr_fn=adjust_lr_fn,
         has_complex=has_complex,
         _prevalidated=True,
+        _skip_input_checks=_skip_input_checks,
     )
 
 
@@ -1087,8 +1369,9 @@ echelon.__doc__ = (
     when ``rank < s``, ``subspace_frames[i]`` must be a tensor of shape ``(s, rank)``
     with orthonormal columns and ``tail_vecs[i]`` a nonzero tensor of shape ``(l, 1)``.
     Both are updated in place and should be ``torch.float32``: a lower-precision frame is
-    rounded to its dtype again at every step. Their shapes are checked, but not that the frame
-    is orthonormal or that the tail vector is nonzero. Valid starting values are
+    rounded to its dtype again at every step. Their shapes and devices are checked, but not
+    that the initial frame is orthonormal or that the initial tail vector is nonzero. Valid
+    starting values are
     ``torch.linalg.qr(torch.randn(s, rank, device=p.device, dtype=torch.float32))[0].contiguous()`` and
     ``torch.randn(l, 1, device=p.device, dtype=torch.float32)``. :class:`Echelon` also warms them up
     on the first step's update (deferred to the first finite, nonzero update if that

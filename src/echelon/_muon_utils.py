@@ -11,6 +11,7 @@ validation and scaling rather than redefining them.
 import math
 
 import torch
+from torch import Tensor
 
 # Constants from Keller Jordan's Muon post.
 EPS = 1e-7
@@ -27,7 +28,9 @@ def _validate_adjust_lr_fn(adjust_lr_fn: str | None) -> None:
         )
 
 
-def _adjust_lr(lr: float, adjust_lr_fn: str | None, param_shape: torch.Size) -> float:
+def _adjust_lr(
+    lr: float | Tensor, adjust_lr_fn: str | None, param_shape: torch.Size
+) -> float | Tensor:
     """Default learning rate adjustment used by Muon."""
     A, B = param_shape[:2]
 

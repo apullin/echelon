@@ -8,19 +8,31 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.11"
+            torch-spec: "torch==2.9.*"
+          - python-version: "3.12"
+            torch-spec: "torch>=2.9"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.12"
-      - name: Install CPU torch, pytest, and the package
+          python-version: ${{ matrix.python-version }}
+      - name: Install CPU torch, dev tools, and the package
         run: |
           uv venv
           uv pip install --python .venv/bin/python \
             --index-url https://download.pytorch.org/whl/cpu \
             --extra-index-url https://pypi.org/simple \
-            "torch>=2.9" pytest
+            "${{ matrix.torch-spec }}" setuptools pytest mypy ruff
           uv pip install --python .venv/bin/python -e . --no-deps
+      - name: Lint and type-check
+        run: |
+          uv run --no-sync ruff check src tests benchmarks examples
+          uv run --no-sync mypy src/echelon
       - name: Run tests
         run: uv run --no-sync pytest -q
       - name: Run the example

@@ -55,7 +55,9 @@ def bench_single(shape, rank, iters, warmup):
         params = [Parameter(torch.randn(shape)) for _ in range(1)]
         grads = [torch.randn(shape) for _ in range(1)]
         opt = make_opt(params)
-        ms = _time_step(lambda: _step_only(params, grads, opt), iters, warmup)
+        ms = _time_step(
+            lambda ps=params, gs=grads, o=opt: _step_only(ps, gs, o), iters, warmup
+        )
         results[name] = ms
     return results
 
@@ -73,7 +75,9 @@ def bench_many(n_layers, shape, rank, iters, warmup):
         params = [Parameter(torch.randn(shape)) for _ in range(n_layers)]
         grads = [torch.randn(shape) for _ in range(n_layers)]
         opt = make_opt(params)
-        ms = _time_step(lambda: _step_only(params, grads, opt), iters, warmup)
+        ms = _time_step(
+            lambda ps=params, gs=grads, o=opt: _step_only(ps, gs, o), iters, warmup
+        )
         results[name] = ms
     return results
 
@@ -90,7 +94,7 @@ def main() -> None:
     for shape, rank in [((64, 64), 16), ((128, 256), 16), ((256, 256), 32), ((512, 512), 64)]:
         r = bench_single(shape, rank, args.iters, args.warmup)
         print(
-            f"{str(shape):>12} {rank:>4}  {r['echelon']:9.2f} {r['echelon-foreach']:9.2f} "
+            f"{shape!s:>12} {rank:>4}  {r['echelon']:9.2f} {r['echelon-foreach']:9.2f} "
             f"{r['muon']:9.2f} {r['adamw']:9.2f}  {r['echelon-foreach'] / r['echelon']:6.2f}x"
         )
     print("\nmany same-shape matrices, 12 layers (ms/step):")
@@ -98,7 +102,7 @@ def main() -> None:
     for shape, rank in [((128, 128), 16), ((256, 256), 32)]:
         r = bench_many(12, shape, rank, args.iters, args.warmup)
         print(
-            f"{str(shape):>12} {rank:>4}  {r['echelon']:9.2f} {r['echelon-foreach']:9.2f} "
+            f"{shape!s:>12} {rank:>4}  {r['echelon']:9.2f} {r['echelon-foreach']:9.2f} "
             f"{r['muon']:9.2f} {r['adamw']:9.2f}  {r['echelon-foreach'] / r['echelon']:6.2f}x"
         )
 
